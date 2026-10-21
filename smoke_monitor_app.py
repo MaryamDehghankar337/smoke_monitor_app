@@ -1,5 +1,5 @@
 """AOI-first Sentinel smoke / methane dashboard.
-No reference-image selector. Daily S5P retrievals; automatic past-only S2 context.
+No reference-image selector. Direct daily S5P retrievals; automatic past-only S2 context.
 S2 composite pixels carry their acquisition date. Stale candidates are not daily smoke.
 """
 from __future__ import annotations
@@ -7,6 +7,8 @@ import io, json, math, re, hashlib, time, zipfile, base64
 from datetime import datetime, timedelta, date
 from pathlib import Path
 from typing import Optional
+import traceback
+import html
 import numpy as np
 import pandas as pd
 import requests
@@ -31,7 +33,7 @@ import matplotlib.pyplot as plt
 STAC_URL="https://stac.dataspace.copernicus.eu/v1/"
 TOKEN_URL="https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 PROCESS_URL="https://sh.dataspace.copernicus.eu/api/v1/process"
-CACHE_DIR=Path.home()/".smoke_dashboard_v8"
+CACHE_DIR=Path.home()/".smoke_dashboard_v9_direct"
 RESULT_DIR=CACHE_DIR/"sessions"
 CACHE_DIR.mkdir(parents=True,exist_ok=True)
 RESULT_DIR.mkdir(parents=True,exist_ok=True)
@@ -292,96 +294,196 @@ def response_error(response):
         return response.text[:1200]
 
 
-def process_request(payload,key,bands):
+def process_request(payload,key,bands,force=False):
     path=CACHE_DIR/(key+".tif")
-    if path.exists():
+    if path.exists() and not force:
         try:
             with rasterio.open(path) as ds:
-                if ds.count==bands:
+                if ds.count==bands and ds.crs is not None:
                     ds.read()
                     return path
         except Exception:
             pass
     token=get_access_token()
+    response=None
     for attempt in range(3):
         try:
             response=requests.post(PROCESS_URL,json=payload,
                 headers={"Authorization":f"Bearer {token}","Content-Type":"application/json"},timeout=(25,150))
         except requests.exceptions.Timeout as exc:
-            raise RuntimeError("CDSE timeout (25 s connect / 150 s read inactivity); retry resumes from the cache.") from exc
+            raise RuntimeError("CDSE timeout: connection 25 s / read inactivity 150 s. This is a request failure, NOT no imagery.") from exc
         except requests.exceptions.RequestException as exc:
-            raise RuntimeError("Network connection to CDSE failed; retry resumes from the cache.") from exc
+            raise RuntimeError("Connection to CDSE failed. This is a network failure, NOT zero pollution.") from exc
         if response.status_code==401 and attempt<2:
             auth=st.session_state.get("cdse_auth")
             updated=refresh_cdse_session(auth) if auth else None
             if updated:
-                st.session_state.cdse_auth=updated; token=updated["access_token"]
+                st.session_state.cdse_auth=updated;token=updated["access_token"]
                 continue
         if response.status_code in (429,502,503,504) and attempt<2:
-            time.sleep(2**(attempt+1))
-            continue
+            try:wait=min(15,max(1,float(response.headers.get("Retry-After",2**(attempt+1)))))
+            except Exception:wait=2**(attempt+1)
+            time.sleep(wait);continue
         break
     if response.status_code>=400:
         raise RuntimeError(f"CDSE HTTP {response.status_code}: {response_error(response)}")
     try:
-        with MemoryFile(response.content) as mem:
-            with mem.open() as ds:
-                if ds.count!=bands:
-                    raise ValueError("Unexpected band count")
-                ds.read()
+        with MemoryFile(response.content) as memory:
+            with memory.open() as ds:
+                if ds.count!=bands or ds.crs is None:
+                    raise ValueError(f"Expected {bands} georeferenced bands, got {ds.count}; CRS={ds.crs}")
+                array=ds.read()
+                profile=ds.profile.copy()
+                audit={"bands":ds.count,"width":ds.width,"height":ds.height,"crs":str(ds.crs),
+                    "nodata":ds.nodata,"mask_positive":int((array[7 if bands==9 else 1]>0.5).sum()),
+                    "first_band_finite":int(np.isfinite(array[0]).sum()),
+                    "first_band_nonzero":int((np.isfinite(array[0])&(array[0]!=0)&(array[0]!=-9999)).sum()),
+                    "timeRange":payload["input"]["data"][0]["dataFilter"]["timeRange"],
+                    "received_utc":datetime.utcnow().isoformat()+"Z"}
     except Exception as exc:
-        raise RuntimeError("CDSE did not return a valid TIFF; response was not cached.") from exc
+        raise RuntimeError(f"CDSE returned an invalid or non-georeferenced TIFF: {exc}") from exc
     tmp=path.with_suffix(".tif.part")
     try:
-        tmp.write_bytes(response.content); tmp.replace(path)
+        tmp.write_bytes(response.content);tmp.replace(path)
+        atomic_json(path.with_suffix(".audit.json"),audit)
     finally:
         tmp.unlink(missing_ok=True)
     return path
 
 
 def s2_script(day):
-    target=datetime.combine(day,datetime.min.time())+timedelta(hours=12)
-    return """//VERSION=3
+    # A daily request has an unambiguous acquisition calendar date; no scene-metadata parsing.
+    epoch_day=(day-EPOCH).days
+    script="""//VERSION=3
 function setup(){return {
  input:[{bands:["B02","B03","B04","B08","B11","B12","SCL","dataMask"],
  units:["REFLECTANCE","REFLECTANCE","REFLECTANCE","REFLECTANCE","REFLECTANCE","REFLECTANCE","DN","DN"]}],
- mosaicking:"TILE",output:{bands:9,sampleType:"FLOAT32"}};}
-function evaluatePixel(samples,scenes){
- var best=null,bestScore=1e30,obs=-9999;
- var target=Date.parse("__TARGET__");
- for(var i=0;i<samples.length;i++){
-  var s=samples[i]; if(s.dataMask!==1)continue;
-  var stamp=Date.parse(scenes.tiles[i].date);if(!isFinite(stamp))continue;
-  var age=(target-stamp)/86400000;
-  var penalty=([0,1,3,8,9,10,11].indexOf(s.SCL)>=0)?1000:0;
-  var score=penalty+Math.max(0,age);
-  if(score<bestScore){best=s;bestScore=score;obs=Math.floor(stamp/86400000);}
- }
- if(best===null)return [0,0,0,0,0,0,0,0,-9999];
- return [best.B02,best.B03,best.B04,best.B08,best.B11,best.B12,best.SCL,1,obs];
+ mosaicking:"SIMPLE",output:{bands:9,sampleType:"FLOAT32",nodataValue:-9999}};}
+function evaluatePixel(s){
+ if(!(Number(s.dataMask)>0))return [-9999,-9999,-9999,-9999,-9999,-9999,0,0,-9999];
+ return [s.B02,s.B03,s.B04,s.B08,s.B11,s.B12,s.SCL,1,__DAY__];
 }
-""".replace("__TARGET__",target.strftime("%Y-%m-%dT%H:%M:%SZ"))
+"""
+    return script.replace("__DAY__",str(epoch_day))
 
 
-def request_s2(day,config):
-    # No user-selected scene, tile or reference: all sources in the past 30 days.
+
+def request_s2_day(day,config,force=False):
     g=config["grid"]
-    start=day-timedelta(days=29); end=day+timedelta(days=1)
     payload={"input":{"bounds":{"bbox":g["bounds"],"properties":{"crs":f"http://www.opengis.net/def/crs/EPSG/0/{g['epsg']}"}},
       "data":[{"type":"sentinel-2-l2a","dataFilter":{
-        "timeRange":{"from":str(start)+"T00:00:00Z","to":str(end)+"T00:00:00Z"},
-        "mosaickingOrder":"mostRecent","maxCloudCoverage":100},
+        "timeRange":{"from":str(day)+"T00:00:00Z","to":str(day+timedelta(days=1))+"T00:00:00Z"},
+        "mosaickingOrder":"leastCC","maxCloudCoverage":100},
         "processing":{"upsampling":"NEAREST","downsampling":"NEAREST"}}]},
       "output":{"width":g["w"],"height":g["h"],"responses":[{"identifier":"default","format":{"type":"image/tiff"}}]},
       "evalscript":s2_script(day)}
-    return process_request(payload,fingerprint(["s2-past30-v8",payload]),9)
+    return process_request(payload,fingerprint(["s2-daily-simple-v9",payload]),9,force=force)
+
+
+def context_dates(day,config):
+    key=fingerprint(["s2-dates-v9",config["aoi"],str(day-timedelta(days=29)),str(day)])
+    path=CACHE_DIR/(key+".json")
+    if path.exists():
+        info=json.loads(path.read_text())
+        return [date.fromisoformat(s) for s in info["dates"]],info.get("note","")
+    try:
+        records=find_catalog(config["aoi"],day-timedelta(days=29),day)
+        dates=sorted({get_datetime(r).date() for r in records if get_datetime(r) and get_datetime(r).date()<day},reverse=True)
+        atomic_json(path,{"dates":[str(d) for d in dates]})
+        return dates,""
+    except Exception as exc:
+        return [],"Catalogue failed; only the selected-day request was attempted: "+str(exc)
+
+
+def merge_daily_arrays(items,day,allow_medium=False):
+    # All daily inputs must share one exact grid. Pixel dates are retained, never guessed.
+    if not items:raise ValueError("No successful daily raster to merge")
+    output=np.array(items[0][1],dtype=np.float32,copy=True)
+    output[:]= -9999
+    output[6:8]=0
+    score=np.full(output.shape[1:],np.inf,dtype=np.float32)
+    reject=[0,1,3,9,10,11] if allow_medium else [0,1,3,8,9,10,11]
+    for acquisition,array in items:
+        if array.shape!=output.shape:raise ValueError("Daily S2 grids are not aligned")
+        finite=np.isfinite(array[:6]).all(axis=0)&(array[:6]!=-9999).all(axis=0)
+        observed=(array[7]>0.5)&finite
+        scl=np.nan_to_num(array[6],nan=0).astype(np.int32)
+        good=observed&~np.isin(scl,reject)
+        source_day=array[8]
+        age=(day-EPOCH).days-source_day
+        observed &= np.isfinite(source_day)&(source_day!=-9999)&(age>=0)&(age<30)
+        priority=np.where(good,0.0,1000.0)+age
+        use=observed&(priority<score)
+        output[:,use]=array[:,use]
+        score[use]=priority[use]
+    return output
+
+
+def request_s2(day,config,force=False,status=None):
+    key=fingerprint(["s2-python-composite-v9",day,config["aoi"],config["grid"],config["params"]["medium_cloud"]])
+    output_path=CACHE_DIR/(key+".tif")
+    if output_path.exists() and not force:
+        try:
+            with rasterio.open(output_path) as ds:
+                if ds.count==9 and ds.crs is not None:
+                    ds.read();return output_path
+        except Exception:pass
+    arrays=[];profile=None;notes=[];used=[]
+    # The chosen day is always requested first; context dates are automatic, not references.
+    try:
+        path=request_s2_day(day,config,force=force)
+        with rasterio.open(path) as ds:arrays.append((day,ds.read().astype(np.float32)));profile=ds.profile.copy()
+        used.append(str(day))
+    except Exception as exc:
+        # A failed current-day request must not be masked by showing an older date.
+        raise RuntimeError("S2 selected-day download failed: "+str(exc)) from exc
+    merged=merge_daily_arrays(arrays,day,config["params"]["medium_cloud"])
+    inside=clip_mask(profile,*merged.shape[1:],config["aoi"])
+    reject=[0,1,3,9,10,11] if config["params"]["medium_cloud"] else [0,1,3,8,9,10,11]
+    initial_good=(merged[7]>0.5)&~np.isin(merged[6].astype(np.int32),reject)&inside
+    if initial_good.sum()/max(1,inside.sum())>=0.98:
+        dates,note=[],"Selected-day usable coverage is already at least 98%; no older context requested."
+    else:
+        dates,note=context_dates(day,config)
+    if note:notes.append(note)
+    max_context=6
+    attempts=0
+    for candidate in dates:
+        assessable=(merged[7]>0.5)&~np.isin(merged[6].astype(np.int32),reject)&inside
+        if assessable.sum()/max(1,inside.sum())>=0.98:break
+        if attempts>=max_context:
+            notes.append("Stopped after six older acquisition days to bound request cost; unobserved areas remain unknown.")
+            break
+        attempts+=1
+        if status is not None:status.caption(f"S2 · completing context with {candidate} ({attempts}/{max_context})")
+        try:
+            path=request_s2_day(candidate,config)
+            with rasterio.open(path) as ds:
+                array=ds.read().astype(np.float32)
+                if ds.transform!=profile["transform"] or ds.crs!=profile["crs"]:
+                    raise ValueError("Daily raster CRS/transform mismatch")
+            merged=merge_daily_arrays([(day,merged),(candidate,array)],day,config["params"]["medium_cloud"])
+            # Retain the actual per-pixel acquisition date from each daily image.
+            used.append(str(candidate))
+        except Exception as exc:notes.append(f"Context {candidate} failed: {exc}")
+    # Merge function below uses per-pixel date values, so repeated passes preserve provenance.
+    prof=profile.copy();prof.update(count=9,dtype="float32",nodata=-9999,compress="deflate",tiled=False)
+    tmp=output_path.with_suffix(".tif.part")
+    try:
+        with rasterio.open(tmp,"w",**prof) as ds:ds.write(merged)
+        tmp.replace(output_path)
+    finally:tmp.unlink(missing_ok=True)
+    atomic_json(output_path.with_suffix(".context.json"),{"used_dates":used,"notes":notes,"method":"daily SIMPLE requests + date-preserving Python mosaic"})
+    return output_path
 
 
 def read_s2(path,aoi):
     with rasterio.open(path) as ds:
-        array=ds.read().astype(np.float32); profile=ds.profile.copy()
+        array=ds.read().astype(np.float32);profile=ds.profile.copy()
+    if array.shape[0]!=9:raise ValueError("S2 TIFF must have exactly nine bands")
     inside=clip_mask(profile,*array.shape[1:],aoi)
-    observed=(array[7]>0.5)&inside
+    array[:6][array[:6]==-9999]=np.nan
+    observed=(array[7]>0.5)&inside&np.isfinite(array[:6]).all(axis=0)
     bands={key:array[i] for i,key in enumerate(BANDS)}
     bands["dataMask"]=observed.astype(np.float32)
     for key in BANDS:
@@ -425,37 +527,50 @@ def smoke_screen(bands,day,params):
 
 
 def s5_script(band):
-    # Every output pixel is the mean of valid observations on this calendar day.
-    return """//VERSION=3
-function setup(){return {input:[{bands:["__BAND__","dataMask"]}],
- mosaicking:"ORBIT",output:{bands:3,sampleType:"FLOAT32"}};}
-function evaluatePixel(samples){var total=0,n=0;
- for(var i=0;i<samples.length;i++){var s=samples[i];
- if(s.dataMask===1&&isFinite(s.__BAND__)){total+=s.__BAND__;n++;}}
- return n>0?[total/n,1,n]:[0,0,0];}
-""".replace("__BAND__",band)
+    # SIMPLE is deliberately used for one 24-hour interval. No temporal mean.
+    units={"CH4":"PPB","CO":"MOL_M2","NO2":"MOL_M2","SO2":"MOL_M2",
+           "HCHO":"MOL_M2","O3":"MOL_M2","AER_AI_340_380":"INDEX","AER_AI_354_388":"INDEX",
+           "CLOUD_BASE_PRESSURE":"PASCALS","CLOUD_TOP_PRESSURE":"PASCALS",
+           "CLOUD_BASE_HEIGHT":"METERS","CLOUD_TOP_HEIGHT":"METERS",
+           "CLOUD_OPTICAL_THICKNESS":"OPTICAL_DEPTH","CLOUD_FRACTION":"FRACTION"}
+    script="""//VERSION=3
+function setup(){return {
+ input:[{bands:["__BAND__","dataMask"],units:["__UNIT__","DN"]}],
+ mosaicking:"SIMPLE",output:{bands:3,sampleType:"FLOAT32",nodataValue:-9999}};}
+function evaluatePixel(sample){
+ var value=sample.__BAND__;
+ var ok=Number(sample.dataMask)>0 && typeof value==="number" && isFinite(value) && value!==-9999;
+ return ok ? [value,1,1] : [-9999,0,0];
+}
+"""
+    return script.replace("__BAND__",band).replace("__UNIT__",units[band])
 
 
-def request_s5(day,product,config):
+def request_s5(day,product,config,force=False):
     bounds=shape(config["aoi"]).bounds
     ratio=max(0.1,(bounds[2]-bounds[0])*math.cos(math.radians((bounds[1]+bounds[3])/2))/max(1e-6,bounds[3]-bounds[1]))
     w=max(1,round(420*min(1,ratio)));h=max(1,round(420*min(1,1/ratio)))
     qa=config["qa"] if config["qa_override"] else (75 if product=="NO2" else 50)
-    payload={"input":{"bounds":{"bbox":list(bounds),"properties":{"crs":"http://www.opengis.net/def/crs/EPSG/0/4326"}},
+    payload={"input":{"bounds":{"bbox":list(bounds),"properties":{"crs":"http://www.opengis.net/def/crs/OGC/1.3/CRS84"}},
         "data":[{"type":"sentinel-5p-l2","dataFilter":{"timeRange":{
             "from":str(day)+"T00:00:00Z","to":str(day+timedelta(days=1))+"T00:00:00Z"},
             "mosaickingOrder":"mostRecent"},"processing":{"minQa":qa,"upsampling":"NEAREST"}}]},
         "output":{"width":w,"height":h,"responses":[{"identifier":"default","format":{"type":"image/tiff"}}]},
         "evalscript":s5_script(ALL_PRODUCTS[product]["band"])}
-    return process_request(payload,fingerprint(["s5-daily-v8",payload]),3)
+    return process_request(payload,fingerprint(["s5-direct-simple-v9",payload]),3,force=force)
 
 
 def read_s5(path,aoi):
     with rasterio.open(path) as ds:
-        values=ds.read(1).astype(np.float32); valid=ds.read(2)>0.5
+        values=ds.read(1).astype(np.float32)
+        raw_mask=ds.read(2)
+        nodata=ds.nodata
         profile=ds.profile.copy()
     inside=clip_mask(profile,*values.shape,aoi)
-    values[~(valid&inside)|~np.isfinite(values)]=np.nan
+    valid=(raw_mask>0.5)&inside&np.isfinite(values)&(values!=-9999)
+    if nodata is not None and np.isfinite(nodata):valid &= values!=nodata
+    values[~valid]=np.nan
+    # Valid negatives and zero remain untouched. No positive-only blanket filter.
     return values,profile,inside
 
 
@@ -529,8 +644,10 @@ def add_raster(fmap,rgba,profile,name,show=True,opacity=1):
 def new_result_map(aoi):
     g=shape(aoi);c=g.centroid
     fmap=folium.Map([c.y,c.x],tiles=None,control_scale=True)
-    folium.TileLayer("CartoDB positron",name="Geographic context (not satellite evidence)").add_to(fmap)
-    folium.TileLayer("OpenStreetMap",name="OpenStreetMap context",show=False).add_to(fmap)
+    folium.TileLayer(
+        tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        attr="© OpenStreetMap contributors",name="OpenStreetMap — geographic context",
+        max_zoom=19,show=True).add_to(fmap)
     return fmap
 
 
@@ -566,58 +683,125 @@ def load_record(day,config):
     return {"date":str(day),"products":{},"errors":{}}
 
 
+
+def layer_diagnostics(path,aoi):
+    with rasterio.open(path) as ds:
+        raw=ds.read(1).astype(np.float32);mask=ds.read(2)
+        profile=ds.profile.copy();nodata=ds.nodata
+    inside=clip_mask(profile,*raw.shape,aoi)
+    valid=(mask>0.5)&inside&np.isfinite(raw)&(raw!=-9999)
+    if nodata is not None and np.isfinite(nodata):valid &= raw!=nodata
+    values=raw[valid]
+    notes=[]
+    if not inside.any():notes.append("AOI does not intersect output pixels: geometry/CRS/grid problem, not no pollution.")
+    elif not (mask>0.5).any():notes.append("Server returned dataMask=0 everywhere at the selected QA/date.")
+    elif not valid.any():notes.append("Server returned masked/sentinel/non-finite pixels or no valid overlap with AOI.")
+    if values.size and np.all(values==0):notes.append("All server-marked-valid values are exactly zero. Check raw TIFF and units; these were not generated by a fill operation.")
+    return {"aoi_cells":int(inside.sum()),"server_valid_cells":int((mask>0.5).sum()),
+            "valid_cells":int(values.size),"zero_cells":int((values==0).sum()),
+            "nonzero_cells":int((values!=0).sum()),"negative_cells":int((values<0).sum()),
+            "raw_shape":list(raw.shape),"crs":str(profile["crs"]),"nodata":nodata,
+            "notes":notes}
+
+
+def number_text(value,unit=""):
+    if value is None:return "No valid data"
+    try:
+        if not np.isfinite(value):return "No valid data"
+    except TypeError:return "No valid data"
+    return f"{float(value):.7g}"+(" "+unit if unit else "")
+
+
+def pretty_table(frame):
+    # UI strings avoid tiny mol/m² values being rounded to 0. CSV stays numeric.
+    result=frame.copy()
+    for column in result.columns:
+        if pd.api.types.is_numeric_dtype(result[column]):
+            result[column]=result[column].map(lambda v: number_text(v) if pd.notna(v) else "—")
+    return result
+
+
 def process_day(day,config,status=None,retry=False):
     record=load_record(day,config)
+    if retry:record={"date":str(day),"products":{},"errors":{}}
+    record.setdefault("tracebacks",{})
+    record["attempted_utc"]=datetime.utcnow().isoformat()+"Z"
+    if day>datetime.utcnow().date():
+        for p in (["S2"] if config["smoke"] else [])+config["products"]:
+            record["errors"][p]="Requested date is in the future (UTC). No observation can exist yet."
+        atomic_json(session_folder(config)/(str(day)+".json"),record)
+        return record
     if config["smoke"] and ("s2" not in record or record["errors"].get("S2")):
-        if status:status.caption(f"{day} · S2 automatic AOI mosaic (last 30 days; acquisition ages retained)")
+        if status is not None:status.caption(f"{day} · S2 daily download and automatic context")
         try:
-            path=request_s2(day,config)
+            path=request_s2(day,config,force=retry,status=status)
             bands,profile,inside=read_s2(path,config["aoi"])
+            if not inside.any():raise ValueError("S2 output grid does not overlap AOI; check geometry and CRS.")
             result=smoke_screen(bands,day,config["params"])
             area=abs(profile["transform"].a*profile["transform"].e)/1e6
             denom=max(1,int(inside.sum()))
+            raw_context=path.with_suffix(".context.json")
+            context=json.loads(raw_context.read_text()) if raw_context.exists() else {}
             record["s2"]={"path":str(path),"coverage":float(result["observed"].sum()/denom*100),
                 "quality_coverage":float(result["quality"].sum()/denom*100),
                 "current_coverage":float(result["fresh"].sum()/denom*100),
                 "current_area":float(result["current"].sum()*area) if result["fresh"].any() else None,
-                "historical_area":float(result["historical"].sum()*area),
+                "historical_area":float(result["historical"].sum()*area) if result["quality"].any() else None,
                 "current_pixels":int(result["current"].sum()),"observed_pixels":int(result["observed"].sum()),
                 "current_assessable_pixels":int(result["fresh"].sum()),
-                "candidate_fraction":float(result["smoke"].sum()/max(1,result["quality"].sum()))}
-            record["errors"].pop("S2",None)
-        except Exception as exc:record["errors"]["S2"]=str(exc)
+                "candidate_fraction":float(result["smoke"].sum()/max(1,result["quality"].sum())),
+                "context":context,
+                "status":"same-day assessed" if result["fresh"].any() else ("older context only" if result["observed"].any() else "no returned observation")}
+            record["errors"].pop("S2",None);record["tracebacks"].pop("S2",None)
+        except Exception as exc:
+            record.pop("s2",None)
+            record["errors"]["S2"]=f"{type(exc).__name__}: {exc}"
+            record["tracebacks"]["S2"]=traceback.format_exc()
+        atomic_json(session_folder(config)/(str(day)+".json"),record)
     for product in config["products"]:
         if product in record["products"] and not record["errors"].get(product):continue
-        if status:status.caption(f"{day} · {ALL_PRODUCTS[product]['label']} · daily retrieval")
+        if status is not None:status.caption(f"{day} · {ALL_PRODUCTS[product]['label']} · direct daily values")
         try:
-            path=request_s5(day,product,config)
+            path=request_s5(day,product,config,force=retry)
             values,profile,inside=read_s5(path,config["aoi"])
+            if not inside.any():raise ValueError("S5P output grid has no pixel overlap with AOI; inspect geometry/grid.")
             finite=values[np.isfinite(values)]
+            diagnostic=layer_diagnostics(path,config["aoi"])
+            all_zero=bool(finite.size and np.all(finite==0))
             record["products"][product]={"path":str(path),"coverage":float(finite.size/max(1,inside.sum())*100),
                 "mean":float(finite.mean()) if finite.size else None,
-                "min":float(finite.min()) if finite.size else None,"max":float(finite.max()) if finite.size else None}
-            record["errors"].pop(product,None)
-        except Exception as exc:record["errors"][product]=str(exc)
+                "min":float(finite.min()) if finite.size else None,"max":float(finite.max()) if finite.size else None,
+                "valid_cells":int(finite.size),"all_zero":all_zero,"diagnostics":diagnostic,
+                "status":"no valid retrieval" if not finite.size else ("all returned valid values are zero — inspect diagnostics" if all_zero else "valid direct retrieval")}
+            record["errors"].pop(product,None);record["tracebacks"].pop(product,None)
+        except Exception as exc:
+            record["products"].pop(product,None)
+            record["errors"][product]=f"{type(exc).__name__}: {exc}"
+            record["tracebacks"][product]=traceback.format_exc()
         atomic_json(session_folder(config)/(str(day)+".json"),record)
-    atomic_json(session_folder(config)/(str(day)+".json"),record)
     return record
 
 
 def table_for(config):
     rows=[]
     for stamp in pd.date_range(config["start"],config["end"]):
-        d=stamp.date(); record=load_record(d,config)
-        row={"date":stamp}
-        s2=record.get("s2",{})
-        row["S2_current_candidate_km2"]=s2.get("current_area",np.nan)
-        row["S2_current_coverage_pct"]=s2.get("current_coverage",np.nan)
-        row["S2_context_coverage_pct"]=s2.get("coverage",np.nan)
+        record=load_record(stamp.date(),config);s2=record.get("s2",{})
+        row={"date":stamp,
+             "S2_status":record["errors"].get("S2",s2.get("status","not requested")),
+             "S2_current_candidate_km2":s2.get("current_area",np.nan),
+             "S2_current_coverage_pct":s2.get("current_coverage",np.nan),
+             "S2_context_coverage_pct":s2.get("coverage",np.nan)}
         for product in config["products"]:
             p=record["products"].get(product,{})
             row[product]=p.get("mean",np.nan)
             row[product+"_coverage_pct"]=p.get("coverage",np.nan)
+            row[product+"_status"]=record["errors"].get(product,p.get("status","not requested"))
         rows.append(row)
-    return pd.DataFrame(rows).set_index("date")
+    table=pd.DataFrame(rows).set_index("date")
+    for column in table.columns:
+        if not column.endswith("_status"):
+            table[column]=pd.to_numeric(table[column],errors="coerce")
+    return table
 
 
 def fixed_limits(product,config):
@@ -758,7 +942,7 @@ with control_col:
                 st.session_state.cdse_auth=authenticate_cdse(email,password,totp);st.rerun()
             except Exception as exc:st.error(str(exc))
 st.markdown('<div class="section-label">03 · SELECT WHAT TO DISPLAY</div>',unsafe_allow_html=True)
-smoke_enabled=st.checkbox("Sentinel-2 · Smoke and RGB context",value=True,key="show_smoke")
+smoke_enabled=st.checkbox("Sentinel-2 · Smoke candidates",value=True,key="show_smoke")
 st.caption("Select any S5P products below. Methane and smoke have priority tabs. Both aerosol-index variants are available; cloud fields are separate context products, not pollutants.")
 selected=[]
 cols=st.columns(4)
@@ -784,7 +968,7 @@ with st.expander("Processing settings — appearance and geographic tools are re
     qa_override=st.checkbox("Override official S5P QA defaults",value=False)
     qa=st.slider("S5P QA (%) when override enabled",0,100,50)
     st.caption("Official defaults: NO2 75%, other fields 50%. Lowering QA increases coverage only where low-QA retrievals exist, at a quality cost. No fabricated values are inserted.")
-    st.caption("S2 context automatically uses the previous 30 days, never future observations. No image, tile or reference selection is exposed. Current-day and older candidates remain separate.")
+    st.caption("S2 automatically checks available days in the past 30 days, mosaicking up to six older dates to bound request cost. It never uses future observations. No image, tile or reference selection is exposed. Current-day and older candidates remain separate.")
 region=shape(ensure_aoi(st.session_state.aoi))
 if region.bounds[2]-region.bounds[0]>30 or region.bounds[3]-region.bounds[1]>30:
     st.warning("Please draw a regional AOI (under 30° span in longitude/latitude). This dashboard is not a global processing service.")
@@ -792,7 +976,7 @@ if region.bounds[2]-region.bounds[0]>30 or region.bounds[3]-region.bounds[1]>30:
 grid=grid_for(ensure_aoi(st.session_state.aoi),resolution)
 params={"threshold":float(threshold),"min_pixels":int(min_pixels),"dilation":int(dilation),
         "brightness":brightness,"swir_ratio":swir_ratio,"smooth":smooth,"medium_cloud":medium}
-config={"version":"v8.1","aoi":ensure_aoi(st.session_state.aoi),"start":str(start),"end":str(end),
+config={"version":"v9.2-direct","aoi":ensure_aoi(st.session_state.aoi),"start":str(start),"end":str(end),
         "products":selected,"smoke":smoke_enabled,"params":params,"qa_override":qa_override,"qa":qa,"grid":grid}
 signature=fingerprint(config)
 st.caption(f"Actual S2 regional grid: {grid['res']} m · {grid['w']} × {grid['h']} pixels. Requested resolution is automatically coarsened for large AOIs; full-region detail is not claimed to be native 20 m.")
@@ -809,7 +993,7 @@ left,right=st.columns([1,1])
 connected=bool(st.session_state.get("cdse_auth"))
 load_one=left.button("🛰️ Display / retry selected day",type="primary",use_container_width=True,disabled=not connected)
 load_month=right.button("🎬 Prepare / resume all 30 days",use_container_width=True,disabled=not connected)
-st.caption("Selected-day mode downloads only what is needed. Once enabled, moving the slider fetches the new date automatically. Preparing the full month is optional, resumable, and may require many API requests.")
+st.caption("Retry genuinely refreshes selected-day API requests; monthly resume reuses successful results. Selected-day mode downloads only what is needed. Once enabled, moving the slider fetches the new date automatically. Preparing the full month is optional, resumable, and may require many API requests.")
 active_key="active_"+signature
 if load_one or load_month:st.session_state[active_key]=True
 if load_month:
@@ -842,7 +1026,8 @@ if connected and st.session_state.get(active_key) and should_request:
     finally:status.empty()
 if not record.get("s2") and not record["products"]:
     if record["errors"]:
-        st.error("No layer completed for this date. Exact errors are shown below.")
+        st.error("The requests failed. This is not evidence of zero pollution or no imagery.")
+        st.json(record["errors"])
     else:st.info("Connect Copernicus, select products, then display the selected day. No image or reference needs selecting.")
 else:
     st.markdown(f'<div class="result-head">{day} · Whole-AOI results</div><div class="result-sub">One geographic extent. All product maps use the selected AOI; older S2 context is explicitly dated.</div>',unsafe_allow_html=True)
@@ -857,25 +1042,32 @@ else:
             if product=="S2":
                 item=record.get("s2")
                 if not item:
-                    st.warning("S2 observation unavailable for this date. No pollution value has been inferred.")
-                    if record["errors"].get("S2"):st.caption(record["errors"]["S2"])
+                    failure=record["errors"].get("S2")
+                    if failure:
+                        st.error("S2 DOWNLOAD / PROCESSING FAILED — not a statement about image availability.")
+                        st.code(failure,language=None)
+                        with st.expander("S2 technical traceback",expanded=False):
+                            st.code(record.get("tracebacks",{}).get("S2","No traceback recorded."),language="text")
+                    else:
+                        st.info("S2 has not been downloaded for this date yet. Click Display / retry selected day.")
                     continue
                 bands,profile,inside=read_s2(item["path"],config["aoi"])
                 result=smoke_screen(bands,day,params)
                 m1,m2,m3,m4=st.columns(4)
-                m1.metric("30-day image-context coverage",f"{item['coverage']:.1f}%")
+                m1.metric("Available observation-context coverage",f"{item['coverage']:.1f}%")
                 m2.metric("Same-day assessable coverage",f"{item['current_coverage']:.1f}%")
                 m3.metric("Same-day candidate area",f"{item['current_area']:.2f} km²" if item["current_area"] is not None else "No same-day data")
-                m4.metric("Older-context candidate area",f"{item['historical_area']:.2f} km²")
+                m4.metric("Older-context candidate area",number_text(item.get("historical_area"),"km²"))
                 st.caption("Red = same-day spectral candidates. Amber = candidates on older observations, NOT smoke confirmed on the selected day. Map background is geographic context, not invented satellite imagery.")
                 if item["coverage"]<99:
                     st.warning(f"Even the automatic 30-day context has only {item['coverage']:.1f}% observed coverage. Remaining locations have no returned S2 observation; changing a reference cannot create those measurements.")
                 if item["current_coverage"]<99:
                     st.info("The image is a last-known-observation mosaic, not a single-date photograph. Older pixels improve geographic context only; current-day smoke metrics exclude them.")
-                show_history=st.checkbox("Show older-observation candidate context in amber",value=True,key="history_"+signature)
+                show_history=st.checkbox("Show older-observation candidate context in amber",value=False,key="history_"+signature)
                 fmap=new_result_map(config["aoi"])
                 rgba=rgb_rgba(bands,inside)
-                add_raster(fmap,rgba,profile,"S2 last-known RGB (past 30 days)")
+                show_rgb=st.checkbox("Show S2 RGB background (optional)",value=False,key="rgb_"+signature)
+                add_raster(fmap,rgba,profile,"S2 RGB context (optional)",show=show_rgb)
                 unknown=inside & ~result["observed"]
                 hatch=np.zeros((*unknown.shape,4),dtype=np.uint8)
                 rr,cc=np.indices(unknown.shape)
@@ -890,6 +1082,8 @@ else:
                 finish_map(fmap,config["aoi"],"smoke_map_"+signature+str(day),height=620)
                 st.markdown('<span class="result-chip">🔴 Same-day candidate</span><span class="result-chip">🟠 Older candidate</span><span class="result-chip">▧ No S2 observation</span>',unsafe_allow_html=True)
                 with st.expander("Observation age and smoke-screen diagnostics"):
+                    st.write("S2 processing status:",item.get("status","unknown"))
+                    st.json(item.get("context",{}))
                     st.image(colorbar_png(0,29,"viridis_r","Observation age · days"),use_container_width=True)
                     st.caption(f"Grid: {grid['res']} m. Index=(B03−B11)/(B03+B11). Water is not globally excluded. Clouds, haze, glint and bright surfaces can create false positives; dark smoke can be missed.")
                     st.caption(f"Same-day assessed pixels: {item['current_assessable_pixels']:,}; same-day candidate pixels: {item['current_pixels']:,}.")
@@ -915,13 +1109,16 @@ else:
                     continue
                 values,profile,inside=read_s5(layer["path"],config["aoi"])
                 m1,m2,m3=st.columns(3)
-                m1.metric("AOI display-grid mean",f"{layer['mean']:.5g} {meta['unit']}" if layer["mean"] is not None else "No valid retrieval")
+                m1.metric("Direct-product display-grid mean",number_text(layer.get("mean"),meta["unit"]))
                 m2.metric("Valid AOI coverage",f"{layer['coverage']:.1f}%")
                 qa_used=qa if qa_override else (75 if product=="NO2" else 50)
                 m3.metric("Quality threshold",f"QA ≥ {qa_used}%")
                 if product=="CH4":st.info("CH4 is the column-averaged dry-air methane mixing ratio (XCH4), not a surface concentration or emission rate. Data gaps, including over water, remain unknown.")
                 st.caption(f"Calendar-day retrievals: {day}, UTC. Actual acquisition times need not match S2. No spatial or temporal gap filling is used for S5P measurements.")
-                if layer["mean"] is None:st.warning("No valid retrievals for this product/day/AOI/QA setting. The map below remains geographic context only.")
+                if layer["mean"] is None:
+                    st.warning("No valid retrievals: mean is missing, NOT zero. Coverage 0% is a data-availability statistic, not a pollutant concentration.")
+                elif layer.get("all_zero"):
+                    st.warning("The returned TIFF contains exactly zero at every server-marked-valid pixel. Values are preserved, not fabricated. Inspect diagnostics/raw TIFF before scientific interpretation.")
                 limits=fixed_limits(product,config)
                 rgba=field_rgba(values,limits,meta["cmap"])
                 fmap=new_result_map(config["aoi"])
@@ -929,6 +1126,13 @@ else:
                 finish_map(fmap,config["aoi"],"s5_map_"+signature+product+str(day),height=560)
                 st.image(colorbar_png(*limits,meta["cmap"],meta["unit"]),use_container_width=True)
                 st.caption(f"Frozen display colour range: {limits[0]:.5g} to {limits[1]:.5g} {meta['unit']}. Outside-range values saturate visually but remain unchanged in GeoTIFF. Basemap gaps do not mean clean air.")
+                with st.expander("Direct raster preview, original TIFF and data diagnostics",expanded=layer.get("mean") is None or layer.get("all_zero",False)):
+                    st.write("Retrieval status:",layer.get("status","unknown"))
+                    st.json(layer.get("diagnostics",{}))
+                    audit_path=Path(layer["path"]).with_suffix(".audit.json")
+                    if audit_path.exists():st.json(json.loads(audit_path.read_text()))
+                    st.image(png_bytes(rgba),caption="Direct product raster preview, independent of map tiles. Transparent pixels are no data.",use_container_width=True)
+                    st.download_button("⬇ Original API TIFF (value, dataMask, valid indicator)",Path(layer["path"]).read_bytes(),file_name=f"{day}_{product}_original_api.tif",mime="image/tiff",key="original_"+product)
                 c1,c2=st.columns(2)
                 c1.download_button("⬇ GeoTIFF",tif_bytes(values,profile),file_name=f"{day}_{product}.tif",mime="image/tiff",key="tif_"+product)
                 c2.download_button("⬇ Georeferenced PNG package",package_png(rgba,profile),file_name=f"{day}_{product}_png.zip",mime="application/zip",key="png_"+product)
@@ -937,9 +1141,10 @@ else:
         overview=[]
         for p in selected:
             layer=record["products"].get(p,{})
-            overview.append({"Product":ALL_PRODUCTS[p]["label"],"Mean":layer.get("mean"),"Unit":ALL_PRODUCTS[p]["unit"],
-                             "Valid coverage (%)":layer.get("coverage"),"Status":record["errors"].get(p,"valid" if layer.get("mean") is not None else "no valid retrieval")})
-        st.dataframe(pd.DataFrame(overview),use_container_width=True,hide_index=True)
+            overview.append({"Product":ALL_PRODUCTS[p]["label"],"Mean":number_text(layer.get("mean")),"Unit":ALL_PRODUCTS[p]["unit"],
+                             "Valid coverage (%)":layer.get("coverage"),"Status":record["errors"].get(p,layer.get("status","not requested"))})
+        st.dataframe(pretty_table(pd.DataFrame(overview)),use_container_width=True,hide_index=True)
+        st.caption("Small column amounts are shown with significant digits (for example 3.2e-05), not rounded to zero. A missing mean is not zero.")
     if st.checkbox("Show all selected atmospheric products on one comparison map",key="compare_map_"+signature):
         fmap=new_result_map(config["aoi"])
         for product in selected:
@@ -951,18 +1156,27 @@ else:
         finish_map(fmap,config["aoi"],"compare_"+signature+str(day),height=550)
         st.caption("Enable individual layers in the map control. Each product has its own unit and fixed colour scale; overlapping colours are not a combined pollution index.")
 
+with st.expander("Download this day's diagnostic report (contains no password or token)"):
+    diagnostic_report={"app_version":"v9.2-direct","config":config,"day_record":record,
+                       "note":"Request failure, no valid retrieval, and actual valid zero are separate states. API requests use direct daily SIMPLE evalscripts."}
+    st.download_button("⬇ Diagnostic JSON",json.dumps(diagnostic_report,ensure_ascii=False,indent=2,default=str),
+        file_name=f"{day}_diagnostics.json",mime="application/json",key="diagnostic_json")
+
 st.markdown('<div class="section-label">05 · DAILY CURVES & DOWNLOADS</div>',unsafe_allow_html=True)
 df=table_for(config)
-if df.notna().any().any():
+if df.select_dtypes(include="number").notna().any().any():
     if smoke_enabled:
         st.caption("S2 same-day candidate area (km²) — assess coverage before comparing days. Older-context candidates are not plotted as current smoke.")
         st.line_chart(df[["S2_current_candidate_km2"]],height=190)
         st.line_chart(df[["S2_current_coverage_pct","S2_context_coverage_pct"]],height=170)
     for product in selected:
         st.caption(f"{ALL_PRODUCTS[product]['label']} · {ALL_PRODUCTS[product]['unit']}")
-        st.line_chart(df[[product]],height=180)
-    with st.expander("Daily values, coverage and missing observations"):
-        st.dataframe(df,use_container_width=True)
+        if df[product].notna().any():
+            st.line_chart(df[[product]],height=180)
+        else:
+            st.info(f"{product}: no valid daily values yet; no zero concentration series has been created.")
+    with st.expander("Daily values, coverage, request statuses and missing observations"):
+        st.dataframe(pretty_table(df),use_container_width=True)
     st.download_button("⬇ 30-day observations & coverage CSV",df.to_csv(),file_name="daily_observations_coverage.csv",mime="text/csv",key="month_csv")
     st.caption("Not-yet-requested days and missing observations are NaN, never zero. Use Prepare / resume all 30 days for the full archive. Curves use display-grid means, not an emission inventory.")
 errors=[]
@@ -970,17 +1184,17 @@ for d in days:
     r=load_record(d,config)
     for product,error in r["errors"].items():errors.append({"date":str(d),"product":product,"error":error})
 if errors:
-    with st.expander(f"Exact request errors ({len(errors)})",expanded=not bool(record.get("s2") or record["products"])):
+    with st.expander(f"Exact request errors ({len(errors)})",expanded=True):
         error_df=pd.DataFrame(errors);st.dataframe(error_df,use_container_width=True)
         st.download_button("⬇ Error log",error_df.to_csv(index=False),file_name="request_errors.csv",mime="text/csv")
-if st.button("📦 Prepare downloaded 30-day archive",disabled=not df.notna().any().any()):
+if st.button("📦 Prepare downloaded 30-day archive",disabled=not df.select_dtypes(include="number").notna().any().any()):
     archive_path=session_folder(config)/"downloaded_archive.zip"
     with st.spinner("Packaging cached rasters…"):
         with zipfile.ZipFile(archive_path,"w",zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("config.json",json.dumps(config,ensure_ascii=False,indent=2))
             archive.writestr("daily_observations_coverage.csv",df.to_csv())
             archive.writestr("request_errors.json",json.dumps(errors,ensure_ascii=False))
-            archive.writestr("README.txt","S2 TIFF band order: B02,B03,B04,B08,B11,B12,SCL,dataMask,observation_day. observation_day is integer days since 1970-01-01. S2 is past-only last-known context, not a same-day photograph. S5P bands: daily mean,dataMask,observation_count. Missing retrievals are not zero. All layers are exploratory; no source attribution. config.json defines AOI, QA, grid and screening settings. S2 is a spectral screen, not a validated smoke classifier.")
+            archive.writestr("README.txt","S2 TIFF band order: B02,B03,B04,B08,B11,B12,SCL,dataMask,observation_day. observation_day is integer days since 1970-01-01. S2 is past-only last-known context, not a same-day photograph. S5P bands: direct daily product value,dataMask,valid indicator. No temporal averaging. Missing retrievals are not zero. All layers are exploratory; no source attribution. config.json defines AOI, QA, grid and screening settings. S2 is a spectral screen, not a validated smoke classifier.")
             for d in days:
                 r=load_record(d,config)
                 archive.writestr(str(d)+"/status.json",json.dumps(r,ensure_ascii=False,indent=2))
