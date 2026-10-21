@@ -255,7 +255,8 @@ function setup() {
   return {
     input: [{
       bands: ["B02","B03","B04","B08","B11","B12","SCL"],
-      units: "REFLECTANCE"
+      units: ["REFLECTANCE", "REFLECTANCE", "REFLECTANCE",
+              "REFLECTANCE", "REFLECTANCE", "REFLECTANCE", "DN"]
     }],
     output: {bands: 7, sampleType: "FLOAT32"}
   };
@@ -267,15 +268,81 @@ function evaluatePixel(sample) {
 """
 
 
+def request_process_tiff(payload, access_token, output_path, expected_bands):
+    """Download once, validate the TIFF, and only then publish the cache file."""
+    from rasterio.io import MemoryFile
+
+    try:
+        response = requests.post(
+            PROCESS_URL,
+            headers={"Authorization": f"Bearer {access_token}",
+                     "Content-Type": "application/json"},
+            json=payload,
+            timeout=(30, 180),
+        )
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError(
+            "Download timed out (connection limit: 30 s; read inactivity limit: 180 s). "
+            "Check your connection or try a smaller AOI, then run again."
+        ) from exc
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            "Could not reach the CDSE Process API. Check your internet connection and retry."
+        ) from exc
+
+    if response.status_code >= 400:
+        try:
+            body = response.json()
+            error = body.get("error", body)
+            detail = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        except (ValueError, AttributeError):
+            detail = response.text[:1500]
+        if response.status_code == 401:
+            detail = "Session rejected or expired. Log out and log in to Copernicus again. " + detail
+        elif response.status_code == 429:
+            detail = "CDSE rate limit reached. Wait before trying again. " + detail
+        raise RuntimeError(f"CDSE Process API failed ({response.status_code}): {detail}")
+
+    try:
+        with MemoryFile(response.content) as memory:
+            with memory.open() as dataset:
+                if dataset.count != expected_bands:
+                    raise ValueError(f"Expected {expected_bands} bands, received {dataset.count}.")
+                dataset.read()
+    except Exception as exc:
+        raise RuntimeError("CDSE response is not a readable TIFF with the expected bands.") from exc
+
+    temporary_path = output_path.with_suffix(".tif.part")
+    try:
+        temporary_path.write_bytes(response.content)
+        temporary_path.replace(output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return output_path
+
+
+def cached_tiff_is_valid(path, expected_bands):
+    if not path.exists():
+        return False
+    try:
+        with rasterio.open(path) as source:
+            if source.count != expected_bands:
+                return False
+            source.read()
+        return True
+    except Exception:
+        return False
+
+
 def download_s2_scene(item, aoi, access_token):
     item = as_dict(item)
     aoi = ensure_aoi(aoi)
     cache_id = hashlib.sha256(
-        json.dumps([item.get("id"), aoi, RESOLUTION, "smoke_v1"], sort_keys=True).encode()
+        json.dumps([item.get("id"), aoi, RESOLUTION, "smoke_v2_scl_dn"], sort_keys=True).encode()
     ).hexdigest()[:24]
     folder = CACHE_DIR / cache_id
     output_path = folder / "bands.tif"
-    if output_path.exists():
+    if cached_tiff_is_valid(output_path, len(BANDS)):
         return output_path
 
     folder.mkdir(parents=True, exist_ok=True)
@@ -313,21 +380,8 @@ def download_s2_scene(item, aoi, access_token):
         "evalscript": s2_evalscript(),
     }
 
-    response = requests.post(
-        PROCESS_URL,
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=900,
-    )
-    if response.status_code >= 400:
-        try:
-            detail = response.json()
-        except Exception:
-            detail = response.text[:1000]
-        raise RuntimeError(f"CDSE Process API failed ({response.status_code}): {detail}")
+    return request_process_tiff(payload, access_token, output_path, len(BANDS))
 
-    output_path.write_bytes(response.content)
-    return output_path
 
 
 def read_s2_stack(path):
@@ -473,7 +527,7 @@ def download_s5p_layer(aoi, date_from, date_to, pollutant, access_token):
     ).hexdigest()[:24]
     folder = CACHE_DIR / f"s5p_{pollutant}_{cache_id}"
     output_path = folder / "layer.tif"
-    if output_path.exists():
+    if cached_tiff_is_valid(output_path, 2):
         return output_path
 
     folder.mkdir(parents=True, exist_ok=True)
@@ -502,21 +556,8 @@ def download_s5p_layer(aoi, date_from, date_to, pollutant, access_token):
         "evalscript": s5p_evalscript(band),
     }
 
-    response = requests.post(
-        PROCESS_URL,
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=300,
-    )
-    if response.status_code >= 400:
-        try:
-            detail = response.json()
-        except Exception:
-            detail = response.text[:1000]
-        raise RuntimeError(f"S5P Process API failed ({response.status_code}): {detail}")
+    return request_process_tiff(payload, access_token, output_path, 2)
 
-    output_path.write_bytes(response.content)
-    return output_path
 
 
 def read_s5p(path):
@@ -1088,7 +1129,7 @@ with action_col:
                     st.session_state.smoke_profile = profile
                     st.session_state.smoke_pngs = {
                         "smoke": smoke_png(result["smoke"]),
-                        "valid": smoke_png(result["valid"], ) if False else smoke_png(result["valid"]),
+                        "valid": smoke_png(result["valid"]),
                         "smoke_index": pollutant_png(result["smoke_index"]),
                     }
 
@@ -1102,7 +1143,11 @@ with action_col:
                     if result["smoke"].sum() == 0:
                         st.warning("⚠️ No smoke candidate was detected with the current settings.")
                 except Exception as error:
+                    progress.empty()
+                    progress_status.empty()
                     st.error(f"Smoke detection failed: {error}")
+                else:
+                    progress_status.empty()
     else:
         st.markdown(
             '<div class="card-title">Select scenes first</div>'
@@ -1226,6 +1271,7 @@ with s5p_col2:
     )
 
 if run_s5p:
+    s5p_progress = None
     try:
         access_token = get_access_token()
         target_date = get_datetime(st.session_state.get("target"))
@@ -1256,6 +1302,8 @@ if run_s5p:
         s5p_progress.progress(100, text="Sentinel-5P layers ready")
         st.success(f"Sentinel-5P layers loaded · {len(s5p_data)} pollutant(s)")
     except Exception as s5p_error:
+        if s5p_progress is not None:
+            s5p_progress.empty()
         st.error(f"S5P fetch failed: {s5p_error}")
 
 if "s5p_data" in st.session_state:
