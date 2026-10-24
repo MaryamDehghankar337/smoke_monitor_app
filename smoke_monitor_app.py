@@ -595,14 +595,13 @@ def smoke_screen(bands,day,params):
         bg={};weights=None
         for key,array in (("b",b),("g",g),("r",r),("n",n),("s2",sw2)):
             bg[key],weights=local_mean(array,mask,window)
-        second,_=local_mean(b*b,mask,window)
-        local_std=np.sqrt(np.maximum(second-bg["b"]**2,0))
+        b_small,_=local_mean(b,mask,5)
+        texture,_=local_mean((b-np.nan_to_num(b_small))**2,mask,window)
+        local_std=np.sqrt(np.maximum(texture,0))
         enough=mask&(weights>=params.get("min_background_fraction",.15))
         db,dg,dr,dn,ds=b-bg["b"],g-bg["g"],r-bg["r"],n-bg["n"],sw2-bg["s2"]
-        for array_name in ("db","dg","dr","dn","ds"):
-            locals()[array_name]
-        smooth=lambda a:local_mean(np.nan_to_num(a),enough,max(3,int(params.get("smooth_px",3)))|1)[0]
-        db,dg,dr,dn,ds=smooth(db),smooth(dg),smooth(dr),smooth(dn),smooth(ds)
+        k=max(3,int(params.get("smooth_px",3)))|1
+        db,dg,dr,dn,ds=[local_mean(np.nan_to_num(a),enough,k)[0] for a in (db,dg,dr,dn,ds)]
         z=db/(local_std+.01)
         spectral=(enough&np.isfinite(db)&(db>=params["min_blue_excess"])&(db<.30)&(z>=params["z_min"])
             &(db>=.9*dr)&(dr>-.01)&(dg>0)&(ds<.5*db)&(np.abs(ds)<=np.maximum(.01,.25*db))&(np.abs(dn)<=nir_limit*db))
@@ -618,7 +617,7 @@ def smoke_screen(bands,day,params):
     steps["method"]="same-day local-background haze screen; unvalidated"
     return {"observed":observed,"quality":quality,"smoke":smoke,"fresh":assessable,"current":smoke,
         "historical":np.zeros_like(smoke),"age":np.where(observed,age,np.nan),
-        "index":np.clip(np.nan_to_num(score,nan=np.nan)/.10,-1,1),"diagnostics":steps}
+        "index":np.clip(score/.10,-1,1),"diagnostics":steps}
 
 def s5_script(band):
     return """//VERSION=3
@@ -1009,7 +1008,7 @@ with st.expander("Processing settings — appearance and geographic tools are re
     qa_override=st.checkbox("Override official S5P QA defaults",value=False)
     qa=st.slider("S5P QA (%) when override enabled",0,100,50)
     threshold=.1;brightness=.1;swir_ratio=1.6;smooth=2.0;dilation=1
-    st.caption("S2 screen: same-day image only. Each pixel is compared with its local background separately over land and water. Smoke candidates must brighten blue/visible while SWIR stays almost unchanged (smoke is largely transparent there). Cloud, shadow, glint and SWIR-bright surfaces are rejected. This is an unvalidated screen, not a certified smoke map. Missing/non-assessable areas are UNKNOWN.")
+    st.caption("S2 screen: same-day image only, local-background blue excess with near-constant SWIR. Unvalidated; unassessed areas are UNKNOWN.")
 region=shape(ensure_aoi(st.session_state.aoi))
 if region.bounds[2]-region.bounds[0]>30 or region.bounds[3]-region.bounds[1]>30:
     st.warning("Please draw a regional AOI (under 30° span in longitude/latitude). This dashboard is not a global processing service.")
@@ -1017,7 +1016,7 @@ if region.bounds[2]-region.bounds[0]>30 or region.bounds[3]-region.bounds[1]>30:
 grid=grid_for(ensure_aoi(st.session_state.aoi),resolution)
 params={"threshold":float(threshold),"min_pixels":int(min_pixels),"dilation":int(dilation),
         "brightness":brightness,"swir_ratio":swir_ratio,"smooth":smooth,"medium_cloud":medium,"min_blue_excess":min_blue,"z_min":z_min,"background_km":background_km,"res_m":grid["res"],"smooth_px":3,"max_brightness":.45}
-config={"version":"v14.0-same-day-haze-screen","aoi":ensure_aoi(st.session_state.aoi),"start":str(start),"end":str(end),
+config={"version":"v14.1-same-day-haze-screen","aoi":ensure_aoi(st.session_state.aoi),"start":str(start),"end":str(end),
         "products":selected,"smoke":smoke_enabled,"params":params,"qa_override":qa_override,"qa":qa,"grid":grid,
         "cloud_warning":cloud_warning}
 if st.session_state.get("cdse_auth") and (smoke_enabled or selected):
@@ -1145,16 +1144,17 @@ else:
                 m2.metric("Screen-assessable coverage",f"{item['current_coverage']:.1f}%")
                 m3.metric("Candidate area",f"{item['current_area']:.2f} km²" if item["current_area"] is not None else "Not assessable")
                 m4.metric("Candidate pixels",f"{item.get('current_pixels',0):,}")
-                st.json(item.get("diagnostics",{}))
-                if item["current_area"] is None:st.warning("Image returned, but no pixel could be assessed by the screen (clouds/shadow/brightness/background). Smoke status UNKNOWN, not absent.")
-                elif item["current_pixels"]==0:st.info("No candidates among assessable pixels only. This does not establish absence elsewhere.")
-                st.caption("Red = same-day haze-screen candidates (unvalidated), NOT confirmed smoke or source attribution. Hatched/unassessed areas are unknown, not clean.")
+                with st.expander("Screening diagnostics (pixel counts per step)"):
+                    st.json(item.get("diagnostics",{}))
+                if item["current_area"] is None:st.warning("Image returned, but no pixel could be assessed by the screen. Smoke status UNKNOWN, not absent.")
+                elif item["current_pixels"]==0:st.info("No candidates among assessable pixels only; this does not establish absence elsewhere.")
+                st.caption("Red = same-day haze-screen candidates (unvalidated), NOT confirmed smoke. Hatched/unassessed areas are unknown.")
                 if item["coverage"]>0 and 100*(1-item["quality_coverage"]/item["coverage"])>cloud_warning:
                     st.warning("Cloud/quality-masked fraction exceeds the selected warning threshold; those pixels are not assumed smoke-free.")
                 if item["coverage"]<99:
                     st.warning(f"The selected-day retrieval has only {item['coverage']:.1f}% observed coverage. Remaining locations have no returned selected-day S2 observation.")
                 if item["current_coverage"]<99:
-                    st.info("Only selected-day pixels are shown. No older image fills gaps.")
+                    st.info("Only selected-day pixels are shown.")
                 show_history=False
                 fmap=new_result_map(config["aoi"])
                 rgba=rgb_rgba(bands,inside)
@@ -1176,7 +1176,7 @@ else:
                 with st.expander("Observation age and smoke-screen diagnostics"):
                     st.json(item.get("context",{}))
                     st.image(colorbar_png(0,29,"viridis_r","Observation age · days"),use_container_width=True)
-                    st.caption(f"Nominal grid spacing: {grid['res']} m. Local-background blue excess with SWIR transparency. Turbid water, thin haze, dust, shadows and surface change can still cause false positives; pale smoke and cloud-classified dense smoke can be missed.")
+                    st.caption(f"Nominal grid spacing: {grid['res']} m. Index=(B03−B11)/(B03+B11). Water is not globally excluded. Clouds, haze, glint and bright surfaces can create false positives; dark smoke can be missed.")
                     st.caption(f"Same-day assessed pixels: {item['current_assessable_pixels']:,}; same-day candidate pixels: {item['current_pixels']:,}.")
                 if item.get("candidate_fraction",0)>0.50:
                     st.warning("More than half of assessable context pixels were flagged: probable water/haze/cloud/surface contamination. This is not confirmed smoke coverage.")
@@ -1253,7 +1253,7 @@ else:
         st.caption("Enable individual layers in the map control. Each product has its own unit and fixed colour scale; overlapping colours are not a combined pollution index.")
 
 with st.expander("Download catalogue + request diagnostic report"):
-    st.download_button("⬇ Diagnostic JSON",json.dumps({"app_version":"v14.0-same-day-haze-screen","config":config,"day_record":record},ensure_ascii=False,indent=2,default=str),
+    st.download_button("⬇ Diagnostic JSON",json.dumps({"app_version":"v14.1-same-day-haze-screen","config":config,"day_record":record},ensure_ascii=False,indent=2,default=str),
         file_name=f"{day}_catalogue_diagnostics.json",mime="application/json",key="diagnostic_json")
 
 st.markdown('<div class="section-label">05 · DAILY CURVES & DOWNLOADS</div>',unsafe_allow_html=True)
