@@ -34,7 +34,7 @@ STAC_URL="https://stac.dataspace.copernicus.eu/v1/"
 CATALOG_URL="https://sh.dataspace.copernicus.eu/catalog/v1/search"
 TOKEN_URL="https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 PROCESS_URL="https://sh.dataspace.copernicus.eu/api/v1/process"
-CACHE_DIR=Path.home()/".smoke_dashboard_v14_final"
+CACHE_DIR=Path.home()/".smoke_dashboard_v15_final"
 RESULT_DIR=CACHE_DIR/"sessions"
 CACHE_DIR.mkdir(parents=True,exist_ok=True)
 RESULT_DIR.mkdir(parents=True,exist_ok=True)
@@ -540,11 +540,57 @@ def merge_daily(existing,incoming,day,medium=False):
 
 
 def request_s2(day,config,force=False,status=None):
-    if status is not None:status.caption(f"Sentinel-2 · selected UTC day {day} only")
-    path=request_s2_day(day,config,force)
-    atomic_json(path.with_suffix(".context.json"),{"used_dates":[str(day)],
-        "method":"Selected UTC day only; no earlier image substitutes missing pixels","notes":[],"source_failures":[]})
+    key=fingerprint(["s2-catalogued-mosaic-v10",day,config["aoi"],config["grid"],config["params"]["medium_cloud"]])
+    path=CACHE_DIR/(key+".tif")
+    if path.exists() and not force:return path
+    notes=[]
+    try:
+        dates=catalogue_dates("sentinel-2-l2a",config["aoi"],day-timedelta(days=29),day)
+        selected=sorted(dates,reverse=True)[:7]
+    except Exception as exc:
+        # Unlike v9, a catalogue failure does not stop all older-day attempts.
+        notes.append("Catalogue failed. Bounded daily fallback used: "+str(exc))
+        selected=[day-timedelta(days=n) for n in range(7)]
+    if not selected:
+        raise RuntimeError("Catalogue search completed but found no S2 acquisition in the preceding 30 days for this AOI.")
+    merged=None;profile=None;used=[];failures=[];consecutive_failures=0
+    for candidate in selected:
+        if status is not None:status.caption(f"S2 · source acquisition {candidate}")
+        try:
+            daily=request_s2_day(candidate,config,force=force)
+            with rasterio.open(daily) as ds:
+                array=ds.read().astype(np.float32)
+                if profile is not None and (ds.crs!=profile["crs"] or ds.transform!=profile["transform"]):
+                    raise ValueError("S2 CRS/transform mismatch")
+                profile=ds.profile.copy()
+            merged=merge_daily(merged,array,day,config["params"]["medium_cloud"])
+            used.append(str(candidate));consecutive_failures=0
+            inside=clip_mask(profile,*merged.shape[1:],config["aoi"])
+            reject=[0,1,3,9,10,11] if config["params"]["medium_cloud"] else [0,1,3,8,9,10,11]
+            good=(merged[7]>.5)&inside&~np.isin(merged[6],reject)
+            if good.sum()/max(1,inside.sum())>=0.98:break
+        except Exception as exc:
+            failures.append(f"{candidate}: {exc}")
+            consecutive_failures+=1
+            if consecutive_failures>=2:
+                notes.append("Stopped after two consecutive source request failures; retry is available.")
+                break
+    if merged is None:raise RuntimeError("Every S2 source request failed: "+" | ".join(failures))
+    prof=profile.copy();prof.update(count=9,dtype="float32",nodata=-9999,compress="deflate",tiled=False)
+    tmp=path.with_suffix(".tif.part")
+    try:
+        with rasterio.open(tmp,"w",**prof) as ds:ds.write(merged)
+        tmp.replace(path)
+    finally:tmp.unlink(missing_ok=True)
+    try:
+        import shutil
+        shutil.copyfile(request_s2_day(day,config,force=force),path.with_suffix(".sameday.tif"))
+    except Exception as exc:
+        notes.append("Selected-day detection layer unavailable: "+str(exc))
+    atomic_json(path.with_suffix(".context.json"),{"used_dates":used,"notes":notes,"source_failures":failures,
+        "catalogue":CATALOG_URL,"method":"daily requests + acquisition-date preserving mosaic","max_acquisition_days":7})
     return path
+
 
 def read_s2(path,aoi):
     with rasterio.open(path) as ds:
@@ -556,6 +602,21 @@ def read_s2(path,aoi):
     bands["dataMask"]=observed.astype(np.float32)
     for key in BANDS:
         if key!="dataMask":bands[key][~observed]=np.nan
+    side=Path(path).with_suffix(".sameday.tif")
+    if side.exists():
+        try:
+            with rasterio.open(side) as ds2:
+                a2=ds2.read().astype(np.float32)
+            if a2.shape==array.shape:
+                a2[:6][a2[:6]==-9999]=np.nan
+                ok=(a2[7]>.5)&inside&np.isfinite(a2[:6]).all(axis=0)
+                sb={key:a2[i].copy() for i,key in enumerate(BANDS)}
+                sb["dataMask"]=ok.astype(np.float32)
+                for key in BANDS:
+                    if key!="dataMask":sb[key][~ok]=np.nan
+                bands["same_day_bands"]=sb
+        except Exception:
+            pass
     return bands,profile,inside
 
 
@@ -572,12 +633,14 @@ def local_mean(values,mask,size):
 
 
 def smoke_screen(bands,day,params):
-    b,g,r,n,sw1,sw2=[bands[k] for k in BANDS[:6]]
-    observed=bands["dataMask"]>.5
-    scl=np.nan_to_num(bands["SCL"],nan=0).astype(np.int32)
-    age=(day-EPOCH).days-bands["observation_day"]
-    same=observed&np.isfinite(age)&(age>=0)&(age<1)
-    finite=np.logical_and.reduce([np.isfinite(bands[k]) for k in BANDS[:6]])
+    src=bands.get("same_day_bands",bands)
+    b,g,r,n,sw1,sw2=[src[k] for k in BANDS[:6]]
+    mosaic_observed=bands["dataMask"]>.5
+    observed=src["dataMask"]>.5
+    scl=np.nan_to_num(src["SCL"],nan=0).astype(np.int32)
+    age_src=(day-EPOCH).days-src["observation_day"]
+    same=observed&np.isfinite(age_src)&(age_src>=0)&(age_src<1)
+    finite=np.logical_and.reduce([np.isfinite(src[k]) for k in BANDS[:6]])
     invalid=[0,1,3,9,10,11] if params["medium_cloud"] else [0,1,3,8,9,10,11]
     quality=same&finite&~np.isin(scl,invalid)
     bright=(b+g+r)/3
@@ -614,9 +677,11 @@ def smoke_screen(bands,day,params):
     smoke=np.isin(components,keep)&assessable
     if params["dilation"] and smoke.any():smoke=binary_dilation(smoke,structure=disk(params["dilation"]))&assessable
     steps["final_candidate_pixels"]=int(smoke.sum());steps["background_window_pixels"]=window
+    steps["detection_input"]="selected-day pixels only" if "same_day_bands" in bands else "mosaic fallback restricted to age<1 day"
     steps["method"]="same-day local-background haze screen; unvalidated"
-    return {"observed":observed,"quality":quality,"smoke":smoke,"fresh":assessable,"current":smoke,
-        "historical":np.zeros_like(smoke),"age":np.where(observed,age,np.nan),
+    age=(day-EPOCH).days-bands["observation_day"]
+    return {"observed":mosaic_observed,"same_observed":same,"quality":quality,"smoke":smoke,"fresh":assessable,"current":smoke,
+        "historical":np.zeros_like(smoke),"age":np.where(mosaic_observed,age,np.nan),
         "index":np.clip(score/.10,-1,1),"diagnostics":steps}
 
 def s5_script(band):
@@ -783,12 +848,12 @@ def process_day(day,config,status=None,retry=False):
                 "quality_coverage":float(result["quality"].sum()/denom*100),
                 "current_coverage":float(result["fresh"].sum()/denom*100),
                 "current_area":float((result["current"]*pixel_area).sum()) if result["fresh"].any() else None,
-                "historical_area":None,"diagnostics":result["diagnostics"],"raw_coverage":float(result["observed"].sum()/denom*100),
+                "historical_area":None,"diagnostics":result["diagnostics"],"raw_coverage":float(result["same_observed"].sum()/denom*100),
                 "current_pixels":int(result["current"].sum()),"observed_pixels":int(result["observed"].sum()),
                 "current_assessable_pixels":int(result["fresh"].sum()),
                 "candidate_fraction":float(result["smoke"].sum()/max(1,result["quality"].sum())),
                 "context":json.loads(context_path.read_text()) if context_path.exists() else {},
-                "status":"same-day screened" if result["fresh"].any() else "image returned but not assessable by screen" if result["observed"].any() else "no valid returned image"}
+                "status":"same-day screened" if result["fresh"].any() else "mosaic context only; selected day not assessable" if result["observed"].any() else "no valid returned image"}
             record["errors"].pop("S2",None);record["tracebacks"].pop("S2",None)
         except Exception as exc:
             record.pop("s2",None);record["errors"]["S2"]=str(exc);record["tracebacks"]["S2"]=traceback.format_exc()
@@ -1003,12 +1068,12 @@ with st.expander("Processing settings — appearance and geographic tools are re
     z_min=q2.slider("Minimum contrast vs local variability (z)",0.5,6.0,2.5,0.5)
     background_km=q3.slider("Local-background window (km)",10,80,30,5)
     min_pixels=st.number_input("Minimum connected candidate pixels",min_value=1,max_value=1000,value=4,step=1)
-    resolution=st.selectbox("Requested S2 grid spacing (m)",[20,60,100,250,500,1000],index=2)
+    resolution=st.selectbox("Requested S2 grid spacing (m)",[20,60,100,250,500,1000],index=3)
     medium=st.checkbox("Include SCL medium-probability cloud pixels (dense smoke may be classified as cloud; more false positives)",value=False)
     qa_override=st.checkbox("Override official S5P QA defaults",value=False)
     qa=st.slider("S5P QA (%) when override enabled",0,100,50)
     threshold=.1;brightness=.1;swir_ratio=1.6;smooth=2.0;dilation=1
-    st.caption("S2 screen: same-day image only, local-background blue excess with near-constant SWIR. Unvalidated; unassessed areas are UNKNOWN.")
+    st.caption("Image shown: past-only mosaic (previous 30 days, up to 7 acquisitions) so the whole AOI is visible. Smoke screening: selected-day pixels only, compared with their own local background; older pixels never count as selected-day smoke. Unvalidated screen.")
 region=shape(ensure_aoi(st.session_state.aoi))
 if region.bounds[2]-region.bounds[0]>30 or region.bounds[3]-region.bounds[1]>30:
     st.warning("Please draw a regional AOI (under 30° span in longitude/latitude). This dashboard is not a global processing service.")
@@ -1016,7 +1081,7 @@ if region.bounds[2]-region.bounds[0]>30 or region.bounds[3]-region.bounds[1]>30:
 grid=grid_for(ensure_aoi(st.session_state.aoi),resolution)
 params={"threshold":float(threshold),"min_pixels":int(min_pixels),"dilation":int(dilation),
         "brightness":brightness,"swir_ratio":swir_ratio,"smooth":smooth,"medium_cloud":medium,"min_blue_excess":min_blue,"z_min":z_min,"background_km":background_km,"res_m":grid["res"],"smooth_px":3,"max_brightness":.45}
-config={"version":"v14.1-same-day-haze-screen","aoi":ensure_aoi(st.session_state.aoi),"start":str(start),"end":str(end),
+config={"version":"v15.0-full-mosaic-same-day-detection","aoi":ensure_aoi(st.session_state.aoi),"start":str(start),"end":str(end),
         "products":selected,"smoke":smoke_enabled,"params":params,"qa_override":qa_override,"qa":qa,"grid":grid,
         "cloud_warning":cloud_warning}
 if st.session_state.get("cdse_auth") and (smoke_enabled or selected):
@@ -1140,26 +1205,26 @@ else:
                 bands,profile,inside=read_s2(item["path"],config["aoi"])
                 result=smoke_screen(bands,day,params)
                 m1,m2,m3,m4=st.columns(4)
-                m1.metric("Selected-day raw S2 coverage",f"{item.get('raw_coverage',item['coverage']):.1f}%")
-                m2.metric("Screen-assessable coverage",f"{item['current_coverage']:.1f}%")
+                m1.metric("Full-AOI image coverage (mosaic)",f"{item['coverage']:.1f}%")
+                m2.metric("Selected-day screened coverage",f"{item['current_coverage']:.1f}%")
                 m3.metric("Candidate area",f"{item['current_area']:.2f} km²" if item["current_area"] is not None else "Not assessable")
-                m4.metric("Candidate pixels",f"{item.get('current_pixels',0):,}")
+                m4.metric("Selected-day raw coverage",f"{item.get('raw_coverage',0):.1f}%")
                 with st.expander("Screening diagnostics (pixel counts per step)"):
                     st.json(item.get("diagnostics",{}))
-                if item["current_area"] is None:st.warning("Image returned, but no pixel could be assessed by the screen. Smoke status UNKNOWN, not absent.")
-                elif item["current_pixels"]==0:st.info("No candidates among assessable pixels only; this does not establish absence elsewhere.")
-                st.caption("Red = same-day haze-screen candidates (unvalidated), NOT confirmed smoke. Hatched/unassessed areas are unknown.")
+                if item["current_area"] is None:st.warning("The mosaic is shown for context, but no selected-day pixel could be screened. Smoke status UNKNOWN, not absent.")
+                elif item["current_pixels"]==0:st.info("No candidates among screened selected-day pixels only; this does not establish absence elsewhere.")
+                st.caption("Red = selected-day haze-screen candidates (unvalidated), NOT confirmed smoke. The RGB is a past-only mosaic for context; use the Observation-age layer to see which pixels are older. Older pixels are never screened as selected-day smoke.")
                 if item["coverage"]>0 and 100*(1-item["quality_coverage"]/item["coverage"])>cloud_warning:
                     st.warning("Cloud/quality-masked fraction exceeds the selected warning threshold; those pixels are not assumed smoke-free.")
                 if item["coverage"]<99:
-                    st.warning(f"The selected-day retrieval has only {item['coverage']:.1f}% observed coverage. Remaining locations have no returned selected-day S2 observation.")
+                    st.warning(f"Even the automatic 30-day context has only {item['coverage']:.1f}% observed coverage. Remaining locations have no returned S2 observation; changing a reference cannot create those measurements.")
                 if item["current_coverage"]<99:
-                    st.info("Only selected-day pixels are shown.")
+                    st.info("The image is a last-known-observation mosaic, not a single-date photograph. Older pixels improve geographic context only; current-day smoke metrics exclude them.")
                 show_history=False
                 fmap=new_result_map(config["aoi"])
                 rgba=rgb_rgba(bands,inside)
-                show_rgb=st.checkbox("Show selected-day S2 RGB",value=True,key="rgb_"+signature)
-                add_raster(fmap,rgba,profile,"Selected-day S2 RGB",show=show_rgb)
+                show_rgb=st.checkbox("Show full-AOI S2 RGB mosaic (past-only; older pixels flagged by age layer)",value=True,key="rgb_"+signature)
+                add_raster(fmap,rgba,profile,"S2 RGB mosaic (past-only context)",show=show_rgb)
                 unknown=inside & ~result["observed"]
                 hatch=np.zeros((*unknown.shape,4),dtype=np.uint8)
                 rr,cc=np.indices(unknown.shape)
@@ -1167,16 +1232,21 @@ else:
                 hatch[hatched]=[69,123,157,85]
                 add_raster(fmap,hatch,profile,"No S2 observation — geographic context only")
                 if show_history:add_raster(fmap,mask_rgba(result["historical"],(245,158,11)),profile,"OLDER spectral candidates (not current-day smoke)")
-                add_raster(fmap,mask_rgba(result["current"],(230,57,70)),profile,"SAME-DAY haze-screen candidates (unvalidated)")
+                add_raster(fmap,mask_rgba(result["current"],(230,57,70)),profile,"SELECTED-DAY haze-screen candidates (unvalidated)")
                 ages=field_rgba(result["age"],[0,29],"viridis_r",200)
+                older=inside & result["observed"] & (result["age"]>=1)
+                hatch_old=np.zeros((*older.shape,4),dtype=np.uint8)
+                rr2,cc2=np.indices(older.shape)
+                hatch_old[older & (((rr2-cc2)%14)<2)]=[255,255,255,150]
+                add_raster(fmap,hatch_old,profile,"Pixels older than selected day (white hatch)",show=False)
                 add_raster(fmap,ages,profile,"Observation age (0–29 days)",show=False)
                 add_raster(fmap,field_rgba(np.where(result["observed"],result["index"],np.nan),[-1,1],"inferno"),profile,"Blue-excess score (not smoke probability)",show=False)
                 finish_map(fmap,config["aoi"],"smoke_map_"+signature+str(day),height=620)
-                st.markdown('<span class="result-chip">🔴 Same-day candidate</span><span class="result-chip">▧ No S2 observation / unknown</span>',unsafe_allow_html=True)
+                st.markdown('<span class="result-chip">🔴 Selected-day candidate</span><span class="result-chip">▧ No S2 observation / unknown</span>',unsafe_allow_html=True)
                 with st.expander("Observation age and smoke-screen diagnostics"):
                     st.json(item.get("context",{}))
                     st.image(colorbar_png(0,29,"viridis_r","Observation age · days"),use_container_width=True)
-                    st.caption(f"Nominal grid spacing: {grid['res']} m. Index=(B03−B11)/(B03+B11). Water is not globally excluded. Clouds, haze, glint and bright surfaces can create false positives; dark smoke can be missed.")
+                    st.caption(f"Nominal grid spacing: {grid['res']} m. Local-background blue excess with near-constant SWIR. Turbid water, thin haze, dust, shadows and surface change can cause false positives; pale smoke and cloud-classified dense smoke can be missed.")
                     st.caption(f"Same-day assessed pixels: {item['current_assessable_pixels']:,}; same-day candidate pixels: {item['current_pixels']:,}.")
                 if item.get("candidate_fraction",0)>0.50:
                     st.warning("More than half of assessable context pixels were flagged: probable water/haze/cloud/surface contamination. This is not confirmed smoke coverage.")
@@ -1253,7 +1323,7 @@ else:
         st.caption("Enable individual layers in the map control. Each product has its own unit and fixed colour scale; overlapping colours are not a combined pollution index.")
 
 with st.expander("Download catalogue + request diagnostic report"):
-    st.download_button("⬇ Diagnostic JSON",json.dumps({"app_version":"v14.1-same-day-haze-screen","config":config,"day_record":record},ensure_ascii=False,indent=2,default=str),
+    st.download_button("⬇ Diagnostic JSON",json.dumps({"app_version":"v15.0-full-mosaic-same-day-detection","config":config,"day_record":record},ensure_ascii=False,indent=2,default=str),
         file_name=f"{day}_catalogue_diagnostics.json",mime="application/json",key="diagnostic_json")
 
 st.markdown('<div class="section-label">05 · DAILY CURVES & DOWNLOADS</div>',unsafe_allow_html=True)
