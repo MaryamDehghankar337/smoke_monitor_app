@@ -219,7 +219,7 @@ def create_map(aoi, search_center=None, search_zoom=6):
         if search_center
         else [geometry.centroid.y, geometry.centroid.x]
     )
-    zoom = min(int(search_zoom), 7) if search_center else 6
+    zoom = min(int(search_zoom),7) if search_center else 6
 
     fmap = folium.Map(center, zoom_start=zoom, tiles="OpenStreetMap")
     folium.GeoJson(
@@ -259,11 +259,10 @@ def create_map(aoi, search_center=None, search_zoom=6):
     except Exception:
         pass
 
-    from shapely.geometry import Point
-    if (not search_center) or geometry.contains(Point(float(search_center[1]), float(search_center[0]))):
-        west, south, east, north = geometry.bounds
-        fmap.fit_bounds([[south, west], [north, east]], padding=(15, 15))
-
+    if not search_center:
+        west,south,east,north=geometry.bounds
+        dx=(east-west)*0.18;dy=(north-south)*0.18
+        fmap.fit_bounds([[south-dy,west-dx],[north+dy,east+dx]],max_zoom=9)
     return fmap
 
 
@@ -540,7 +539,7 @@ def merge_daily(existing,incoming,day,medium=False):
     return existing
 
 
-def request_s2(day,config,force=False,status=None):
+def request_s2_context(day,config,force=False,status=None):
     key=fingerprint(["s2-catalogued-mosaic-v10",day,config["aoi"],config["grid"],config["params"]["medium_cloud"]])
     path=CACHE_DIR/(key+".tif")
     if path.exists() and not force:return path
@@ -588,6 +587,28 @@ def request_s2(day,config,force=False,status=None):
     return path
 
 
+def request_s2(day,config,force=False,status=None):
+    if status is not None:status.caption(f"S2 · actual selected UTC day {day}; no historical substitution")
+    daily=request_s2_day(day,config,force=force)
+    key=fingerprint(["same-day-v12",str(day),config["aoi"],config["grid"],config["params"]])
+    target=CACHE_DIR/(key+".tif")
+    import shutil
+    if force or not target.exists():shutil.copyfile(daily,target)
+    notes=[]
+    baseline_path=target.with_suffix(".baseline.tif")
+    baseline_path.unlink(missing_ok=True) if force else None
+    if config["params"].get("method")=="temporal" and not baseline_path.exists():
+        try:
+            baseline_config={**config,"params":dict(config["params"])}
+            source=request_s2_context(day-timedelta(days=1),baseline_config,force=False,status=status)
+            shutil.copyfile(source,baseline_path)
+        except Exception as exc:notes.append("Historical comparison unavailable: "+str(exc))
+    atomic_json(target.with_suffix(".context.json"),{
+        "used_dates":[str(day)],"notes":notes,"source_failures":[],
+        "method":"Selected-day retrieval only. Baseline is comparison only, never substituted.",
+        "baseline_path":str(baseline_path) if baseline_path.exists() else None})
+    return target
+
 def read_s2(path,aoi):
     with rasterio.open(path) as ds:
         array=ds.read().astype(np.float32);profile=ds.profile.copy()
@@ -598,6 +619,12 @@ def read_s2(path,aoi):
     bands["dataMask"]=observed.astype(np.float32)
     for key in BANDS:
         if key!="dataMask":bands[key][~observed]=np.nan
+    comparison=Path(path).with_suffix(".baseline.tif")
+    if comparison.exists():
+        with rasterio.open(comparison) as ds:
+            if ds.shape==array.shape[1:] and ds.transform==profile["transform"] and ds.crs==profile["crs"]:
+                ref=ds.read().astype(np.float32)
+                bands["baseline"]=ref
     return bands,profile,inside
 
 
@@ -611,34 +638,63 @@ def smoke_screen(bands,day,params):
     observed=bands["dataMask"]>0.5
     scl=np.nan_to_num(bands["SCL"],nan=0).astype(np.int32)
     invalid=[0,1,3,9,10,11] if params["medium_cloud"] else [0,1,3,8,9,10,11]
-    quality=observed & ~np.isin(scl,invalid)
     finite=np.logical_and.reduce([np.isfinite(bands[k]) for k in BANDS[:6]])
-    quality &= finite
-    index=nd(g,sw1); bright=(b+g+r)/3
-    ratio=np.divide(sw2,sw1,out=np.full_like(sw1,np.nan),where=sw1>1e-6)
-    vegetation=nd(n,r)
-    ndwi=nd(g,n)
-    water=(scl==6)|((ndwi>0.0)&(n<0.20))
-    candidate=quality & (~water if params.get("exclude_water",True) else True) & (index>params["threshold"]) & (bright>params["brightness"]) & (ratio<params["swir_ratio"]) & (vegetation<0.45)
-    if params["smooth"]>0:
-        weights=gaussian_filter(quality.astype(np.float32),sigma=params["smooth"])
-        values=gaussian_filter(np.where(quality,index,0),sigma=params["smooth"])
-        smooth=np.divide(values,weights,out=np.full_like(values,np.nan),where=weights>0.05)
-        candidate &= smooth>params["threshold"]
+    age=(day-EPOCH).days-bands["observation_day"]
+    same=observed & np.isfinite(age) & (age>=0)&(age<1)
+    quality=observed & ~np.isin(scl,invalid)&finite
+    fresh=quality&same
+    water=(scl==6)|((nd(g,n)>0)&(n<0.20))
+    eligible=fresh & (~water if params.get("exclude_water",False) else True)
+    index=nd(g,sw1)
+    diagnostic={"raw_same_day_pixels":int(same.sum()),
+        "removed_cloud_shadow_invalid":int((same&~quality).sum()),
+        "quality_same_day_pixels":int(fresh.sum()),
+        "removed_by_water_option":int((fresh&~eligible).sum()),
+        "eligible_before_spectral_test":int(eligible.sum())}
+    comparable=np.zeros_like(observed)
+    score=index.copy()
+    if params.get("method")=="temporal":
+        baseline=bands.get("baseline")
+        candidate=np.zeros_like(observed)
+        if baseline is not None:
+            old_age=(day-EPOCH).days-baseline[8]
+            comparable=eligible&(baseline[7]>.5)&~np.isin(baseline[6],invalid)
+            comparable &= np.isfinite(baseline[:6]).all(axis=0)&(baseline[:6]!=-9999).all(axis=0)
+            comparable &= (old_age>=1)&(old_age<=params.get("baseline_days",10))
+            old_visible=baseline[:3].mean(axis=0)
+            visible=(b+g+r)/3
+            dark=old_visible-visible
+            relative=np.divide(dark,np.maximum(old_visible,0.02))
+            candidate=comparable&(dark>params.get("dark_drop",0.035))&(relative>params.get("relative_drop",0.25))
+            score=np.where(comparable,dark,np.nan)
+            diagnostic["baseline_age_min_days"]=float(old_age[comparable].min()) if comparable.any() else None
+            diagnostic["baseline_age_max_days"]=float(old_age[comparable].max()) if comparable.any() else None
+        diagnostic["comparable_pixels"]=int(comparable.sum())
+        assessable=comparable
+    else:
+        bright=(b+g+r)/3
+        ratio=np.divide(sw2,sw1,out=np.full_like(sw1,np.nan),where=sw1>1e-6)
+        candidate=eligible&(index>params["threshold"])&(bright>params["brightness"])&(ratio<params["swir_ratio"])&(nd(n,r)<0.45)
+        assessable=eligible
+    diagnostic["spectral_candidates_before_filtering"]=int(candidate.sum())
+    if params["smooth"]>0 and candidate.any():
+        weights=gaussian_filter(assessable.astype(np.float32),sigma=params["smooth"])
+        values=gaussian_filter(np.where(assessable,np.nan_to_num(score),0),sigma=params["smooth"])
+        smoothed=np.divide(values,weights,out=np.full_like(values,np.nan),where=weights>0.05)
+        cutoff=params.get("dark_drop",0.035) if params.get("method")=="temporal" else params["threshold"]
+        candidate &= smoothed>cutoff
     components,count=label(candidate,structure=np.ones((3,3)))
     sizes=np.bincount(components.ravel(),minlength=count+1)
     keep=np.flatnonzero(sizes>=params["min_pixels"]);keep=keep[keep>0]
-    smoke=np.isin(components,keep)&quality
-    if params.get("exclude_water",True):smoke&=~water
+    smoke=np.isin(components,keep)&assessable
+    diagnostic["after_component_filter"]=int(smoke.sum())
     if params["dilation"] and smoke.any():
-        smoke=binary_dilation(smoke,structure=disk(params["dilation"]))&quality
-        if params.get("exclude_water",True):smoke&=~water
-    age=(day-EPOCH).days-bands["observation_day"]
-    fresh=quality & (age>=0) & (age<1)
-    return {"observed":observed,"quality":quality,"smoke":smoke,"fresh":fresh,
-            "current":smoke&fresh,"historical":smoke&~fresh,"age":np.where(observed,age,np.nan),
-            "index":index}
-
+        smoke=binary_dilation(smoke,structure=disk(params["dilation"]))&assessable
+    diagnostic["final_candidate_pixels"]=int(smoke.sum())
+    diagnostic["method"]=params.get("method","legacy")
+    return {"observed":observed,"quality":quality,"smoke":smoke,"fresh":assessable,
+        "current":smoke,"historical":np.zeros_like(smoke),"age":np.where(observed,age,np.nan),
+        "index":index,"score":score,"diagnostics":diagnostic}
 
 def s5_script(band):
     return """//VERSION=3
@@ -752,9 +808,15 @@ def finish_map(fmap,aoi,key,height=580):
     g=shape(aoi)
     folium.GeoJson(aoi,name="Selected AOI",style_function=lambda _: {"color":"#457b9d","weight":2,"fill":False}).add_to(fmap)
     folium.LayerControl(collapsed=False).add_to(fmap)
-    fmap.fit_bounds([[g.bounds[1],g.bounds[0]],[g.bounds[3],g.bounds[2]]],padding=(10,10))
+    west,south,east,north=g.bounds
+    dx=max((east-west)*0.18,0.01);dy=max((north-south)*0.18,0.01)
+    fmap.fit_bounds([[south-dy,west-dx],[north+dy,east+dx]],padding=(35,35),max_zoom=9)
+    from folium.plugins import Fullscreen
+    Fullscreen().add_to(fmap)
+    if st.button("⌖ Show whole AOI",key="reset_"+key):
+        st.session_state["map_reset_"+key]=st.session_state.get("map_reset_"+key,0)+1
     MousePosition(position="bottomright",prefix="Lat/Lon",num_digits=5).add_to(fmap)
-    st_folium(fmap,key=key,height=height,use_container_width=True,returned_objects=[])
+    st_folium(fmap,key=key+"_view_"+str(st.session_state.get("map_reset_"+key,0)),height=height,use_container_width=True,returned_objects=[])
 
 
 def package_png(rgba,profile):
@@ -799,8 +861,9 @@ def process_day(day,config,status=None,retry=False):
             record["s2"]={"path":str(path),"coverage":float(result["observed"].sum()/denom*100),
                 "quality_coverage":float(result["quality"].sum()/denom*100),
                 "current_coverage":float(result["fresh"].sum()/denom*100),
+                "raw_same_day_coverage":float(result["diagnostics"]["raw_same_day_pixels"]/denom*100),
                 "current_area":float((result["current"]*pixel_area).sum()) if result["fresh"].any() else None,
-                "historical_area":float((result["historical"]*pixel_area).sum()) if result["quality"].any() else None,
+                "historical_area":None,"diagnostics":result["diagnostics"],
                 "current_pixels":int(result["current"].sum()),"observed_pixels":int(result["observed"].sum()),
                 "current_assessable_pixels":int(result["fresh"].sum()),
                 "candidate_fraction":float(result["smoke"].sum()/max(1,result["quality"].sum())),
@@ -914,24 +977,13 @@ st.markdown("""<style>
 [data-testid="stTabs"] [data-baseweb="tab"]{font-weight:750;font-size:.85rem;}
 </style>""",unsafe_allow_html=True)
 st.markdown("""<style>
-:root{color-scheme:light;}
-.stApp button[data-testid="stBaseButton-secondary"],.stApp button[kind="secondary"],
-.stApp [data-testid="stBaseButton-secondaryFormSubmit"],.stApp .stDownloadButton button,
-.stApp [data-testid="stDownloadButton"] button,.stApp a[data-testid="stBaseLinkButton-secondary"],
-.stApp .stButton>button:not([kind="primary"]){
- background:#ffffff !important;background-color:#ffffff !important;border:1.5px solid #457b9d !important;
- color:#111111 !important;-webkit-text-fill-color:#111111 !important;opacity:1 !important;box-shadow:0 1px 3px rgba(29,53,87,.12);}
-.stApp button[data-testid="stBaseButton-secondary"] *,.stApp button[kind="secondary"] *,
-.stApp .stDownloadButton button *,.stApp [data-testid="stDownloadButton"] button *,
-.stApp a[data-testid="stBaseLinkButton-secondary"] *,.stApp .stButton>button:not([kind="primary"]) *{
- color:#111111 !important;-webkit-text-fill-color:#111111 !important;}
-.stApp button[data-testid="stBaseButton-secondary"]:hover,.stApp .stDownloadButton button:hover,
-.stApp a[data-testid="stBaseLinkButton-secondary"]:hover,.stApp .stButton>button:not([kind="primary"]):hover{
- background:#a8dadc !important;border-color:#1d3557 !important;}
-.stApp button:disabled,.stApp button[disabled]{opacity:.55 !important;cursor:not-allowed;}
-.stApp .stButton>button:not([kind="primary"]):disabled{background:#e8eef0 !important;}
-.stApp button[kind="primary"],.stApp button[data-testid="stBaseButton-primary"]{
- background:#e63946 !important;border:1.5px solid #e63946 !important;color:#ffffff !important;}
+.stApp .stButton>button:not([kind="primary"]),.stApp .stDownloadButton button,
+.stApp button[data-testid="stBaseButton-secondary"],.stApp a[data-testid="stBaseLinkButton-secondary"]{
+ background:#fff!important;color:#111!important;-webkit-text-fill-color:#111!important;border:1.5px solid #457b9d!important;opacity:1;}
+.stApp .stButton>button:not([kind="primary"]) *,.stApp .stDownloadButton button *,
+.stApp button[data-testid="stBaseButton-secondary"] *{color:#111!important;-webkit-text-fill-color:#111!important;}
+.stApp .stButton>button:not([kind="primary"]):hover{background:#a8dadc!important;}
+.stApp button:disabled{opacity:.55!important;}
 </style>""",unsafe_allow_html=True)
 st.markdown("""<div class="app-header"><div><div class="app-title">🛰️ Smoke & Methane Monitor</div>
 <div class="app-subtitle">Sentinel-2 smoke context · Sentinel-5P methane and atmospheric products · 30-day explorer</div></div>
@@ -958,7 +1010,7 @@ with map_col:
         if cc.button("✖ Clear"):
             st.session_state.pop("search_center",None);st.session_state.pop("search_name",None);st.rerun()
     mapdata=st_folium(create_map(st.session_state.aoi,st.session_state.get("search_center"),9),
-                       height=430,use_container_width=True,key="aoi_map")
+                       height=365,use_container_width=True,key="aoi_map")
     if mapdata and mapdata.get("all_drawings"):
         geom=normalize_geometry({"type":"FeatureCollection","features":mapdata["all_drawings"]})
         if geom:st.session_state.aoi=geom
@@ -1028,7 +1080,14 @@ with st.expander("Additional Sentinel-5P cloud-context fields",expanded=False):
             if st.checkbox(meta["label"],key="product_"+key):selected.append(key)
 with st.expander("Processing settings — appearance and geographic tools are retained",expanded=False):
     p1,p2,p3=st.columns(3)
-    threshold=p1.number_input("Smoke index threshold",min_value=-0.50,max_value=0.80,value=0.10,step=0.01)
+    method_name=st.selectbox("Experimental screening method",["Temporal darkening — dark-plume candidates","Legacy green/SWIR — water-sensitive candidates"])
+    method="temporal" if method_name.startswith("Temporal") else "legacy"
+    st.warning("Neither method is a validated smoke classifier. Temporal darkening can flag cloud shadows, illumination changes, water/glint and surface change, and can miss pale smoke. Red is an anomaly candidate, NOT confirmed smoke.")
+    exclude_water=st.checkbox("Exclude water (can miss marine smoke)",value=False)
+    baseline_days=st.slider("Maximum comparison-pixel age (days)",1,29,10)
+    dark_drop=st.slider("Temporal absolute visible-reflectance decrease",0.005,0.20,0.035,0.005)
+    relative_drop=st.slider("Temporal relative visible decrease",0.05,0.90,0.25,0.05)
+    threshold=p1.number_input("Legacy green/SWIR threshold",min_value=-0.50,max_value=0.80,value=0.10,step=0.01)
     min_pixels=p2.number_input("Minimum connected candidate pixels",min_value=2,max_value=1000,value=10,step=1)
     dilation=p3.number_input("Final dilation radius",min_value=0,max_value=20,value=2,step=1)
     p4,p5,p6=st.columns(3)
@@ -1036,20 +1095,19 @@ with st.expander("Processing settings — appearance and geographic tools are re
     brightness=p5.slider("Minimum visible brightness",0.01,0.40,0.10,0.01)
     swir_ratio=p6.slider("Maximum B12/B11 ratio",0.2,3.0,1.6,0.05)
     smooth=st.slider("Smoke-index smoothing sigma (pixels)",0.0,6.0,2.0,0.5)
-    exclude_water=st.checkbox("Exclude water and shallow water from smoke candidates (recommended)",value=True)
     medium=st.checkbox("Include medium-cloud pixels in candidate screening (experimental)",value=False)
     qa_override=st.checkbox("Override official S5P QA defaults",value=False)
     qa=st.slider("S5P QA (%) when override enabled",0,100,50)
     st.caption("Official defaults: NO2 75%, other fields 50%. Lowering QA increases coverage only where low-QA retrievals exist, at a quality cost. No fabricated values are inserted.")
-    st.caption("S2 context automatically uses the previous 30 days, never future observations. No image, tile or reference selection is exposed. Current-day and older candidates remain separate.")
+    st.caption("S2 analysis uses the selected UTC day only. In temporal mode an automatic past-only comparison is used, without replacing selected-day pixels. No matched baseline means unknown, not zero.")
 region=shape(ensure_aoi(st.session_state.aoi))
 if region.bounds[2]-region.bounds[0]>30 or region.bounds[3]-region.bounds[1]>30:
     st.warning("Please draw a regional AOI (under 30° span in longitude/latitude). This dashboard is not a global processing service.")
     st.stop()
 grid=grid_for(ensure_aoi(st.session_state.aoi),resolution)
 params={"threshold":float(threshold),"min_pixels":int(min_pixels),"dilation":int(dilation),
-        "brightness":brightness,"swir_ratio":swir_ratio,"smooth":smooth,"medium_cloud":medium,"exclude_water":exclude_water}
-config={"version":"v10.0-available","aoi":ensure_aoi(st.session_state.aoi),"start":str(start),"end":str(end),
+        "brightness":brightness,"swir_ratio":swir_ratio,"smooth":smooth,"medium_cloud":medium,"method":method,"exclude_water":exclude_water,"baseline_days":baseline_days,"dark_drop":dark_drop,"relative_drop":relative_drop}
+config={"version":"v12.0-same-day-manual","aoi":ensure_aoi(st.session_state.aoi),"start":str(start),"end":str(end),
         "products":selected,"smoke":smoke_enabled,"params":params,"qa_override":qa_override,"qa":qa,"grid":grid,
         "cloud_warning":cloud_warning}
 if st.session_state.get("cdse_auth") and (smoke_enabled or selected):
@@ -1095,49 +1153,42 @@ if not smoke_enabled and not selected:
     st.stop()
 st.markdown('<div class="section-label">04 · 30-DAY EXPLORER</div>',unsafe_allow_html=True)
 days=[stamp.date() for stamp in pd.date_range(start,end)]
-connected=bool(st.session_state.get("cdse_auth"))
-msg_slot=st.container()
+options=[str(d) for d in days]
+slider_key="shared_date_"+fingerprint([config["aoi"],str(start),str(end)])
+if st.session_state.get(slider_key) not in options:st.session_state[slider_key]=preferred_catalogue_date(availability,end)
+def move_day(delta):
+    i=options.index(st.session_state[slider_key])
+    st.session_state[slider_key]=options[max(0,min(len(options)-1,i+delta))]
+cprev,cslider,cnext=st.columns([1,10,1])
+cprev.button("◀ Previous",on_click=move_day,args=(-1,),use_container_width=True)
+cnext.button("Next ▶",on_click=move_day,args=(1,),use_container_width=True)
+with cslider:
+    day_string=st.select_slider("Manual shared day — drag to compare maps",options=options,key=slider_key)
+st.caption("Manual only: no autoplay and no timed frames. Prepared days are read from disk. All product tabs follow this date.")
+day=date.fromisoformat(day_string)
 left,right=st.columns([1,1])
+connected=bool(st.session_state.get("cdse_auth"))
 load_one=left.button("🛰️ Display / retry selected day",type="primary",use_container_width=True,disabled=not connected)
 load_month=right.button("🎬 Prepare / resume all 30 days",use_container_width=True,disabled=not connected)
 st.caption("Selected-day mode downloads only what is needed. Once enabled, moving the slider fetches the new date automatically. Preparing the full month is optional, resumable, and may require many API requests.")
 active_key="active_"+signature
 if load_one or load_month:st.session_state[active_key]=True
 if load_month:
-    with msg_slot:
-        progress=st.progress(0,text="Preparing 30-day archive…");status=st.empty()
-        try:
-            for i,one_day in enumerate(days):
-                process_day(one_day,config,status)
-                progress.progress(round(100*(i+1)/len(days)),text=f"{i+1}/30 days processed · {one_day}")
-            lock_month_scales(config)
-            summaries=[load_record(d,config) for d in days]
-            errors_count=sum(len(r["errors"]) for r in summaries)
-            valid_count=sum(layer.get("mean") is not None for r in summaries for layer in r["products"].values())
-            if errors_count:
-                st.warning(f"30 dates attempted, with {errors_count} request error(s). See the error log; resume retries failures and reuses successes.")
-            else:
-                st.success(f"30 dates prepared. {valid_count} product-days have valid S5P retrievals. Missing observations remain explicitly unknown.")
-        except Exception as exc:st.error(f"Preparation stopped: {exc}. Click resume; completed requests are cached.")
-        finally:progress.empty();status.empty()
-options=[str(d) for d in days]
-slider_key="shared_date_"+fingerprint([str(start),str(end),{k:v["days"] for k,v in availability.items()}])
-if st.session_state.get(slider_key) not in options:
-    wanted=preferred_catalogue_date(availability,end)
-    st.session_state[slider_key]=wanted if wanted in options else options[-1]
-def shift_day(delta):
-    cur=options.index(st.session_state[slider_key])
-    st.session_state[slider_key]=options[max(0,min(len(options)-1,cur+delta))]
-def day_label(d):
-    return d+(" ● "+"/".join(k for k,v in availability.items() if d in v["days"]) if any(d in v["days"] for v in availability.values()) else " ○")
-st.markdown("**Shared date — drag the bar (or use ◀ ▶); Sentinel-2 and every selected Sentinel-5P product follow it**")
-cprev,cslide,cnext=st.columns([1,12,1])
-cprev.button("◀",key="prev_day_"+slider_key,on_click=shift_day,args=(-1,),use_container_width=True)
-cnext.button("▶",key="next_day_"+slider_key,on_click=shift_day,args=(1,),use_container_width=True)
-with cslide:
-    day_string=st.select_slider("Shared date",options=options,key=slider_key,format_func=day_label,label_visibility="collapsed")
-st.caption("● = catalogue source exists for the listed products on that date; ○ = no confirmed source.")
-day=date.fromisoformat(day_string)
+    progress=st.progress(0,text="Preparing 30-day archive…");status=st.empty()
+    try:
+        for i,one_day in enumerate(days):
+            process_day(one_day,config,status)
+            progress.progress(round(100*(i+1)/len(days)),text=f"{i+1}/30 days processed · {one_day}")
+        lock_month_scales(config)
+        summaries=[load_record(d,config) for d in days]
+        errors_count=sum(len(r["errors"]) for r in summaries)
+        valid_count=sum(layer.get("mean") is not None for r in summaries for layer in r["products"].values())
+        if errors_count:
+            st.warning(f"30 dates attempted, with {errors_count} request error(s). See the error log; resume retries failures and reuses successes.")
+        else:
+            st.success(f"30 dates prepared. {valid_count} product-days have valid S5P retrievals. Missing observations remain explicitly unknown.")
+    except Exception as exc:st.error(f"Preparation stopped: {exc}. Click resume; completed requests are cached.")
+    finally:progress.empty();status.empty()
 record=load_record(day,config)
 needed=(smoke_enabled and "s2" not in record) or any(p not in record["products"] for p in selected)
 last_request_key="last_requested_day_"+signature
@@ -1150,64 +1201,10 @@ if connected and st.session_state.get(active_key) and should_request:
             record=process_day(day,config,status,retry=load_one)
     except Exception as exc:st.error(str(exc))
     finally:status.empty()
-
-def tl_ok(kind,d):
-    rec=load_record(d,config)
-    if kind=="S2":
-        return bool(rec.get("s2")) and rec["s2"].get("observed_pixels",0)>0
-    layer=rec["products"].get(kind)
-    return bool(layer) and bool(layer.get("path")) and layer.get("mean") is not None
-
-def tl_frame(kind,d):
-    rec=load_record(d,config)
-    if kind=="S2":
-        item=rec["s2"]
-        bands,profile,inside=read_s2(item["path"],config["aoi"])
-        res=smoke_screen(bands,d,config["params"])
-        base=rgb_rgba(bands,inside).copy()
-        base[res["current"]]=[230,57,70,255]
-        label=f"{d} · Sentinel-2 · red = same-day candidates"
-    else:
-        layer=rec["products"][kind]
-        values,profile,inside=read_s5(layer["path"],config["aoi"])
-        base=field_rgba(values,fixed_limits(kind,config),ALL_PRODUCTS[kind]["cmap"],255)
-        label=f"{d} · {ALL_PRODUCTS[kind]['label']}"
-    alpha=base[:,:,3:4].astype(np.float32)/255
-    rgb=base[:,:,:3].astype(np.float32)*alpha+np.array([226,233,236],dtype=np.float32)*(1-alpha)
-    img=Image.fromarray(rgb.astype(np.uint8))
-    scale=max(1,int(round(760/max(1,img.width))))
-    img=img.resize((img.width*scale,img.height*scale),Image.NEAREST)
-    from PIL import ImageDraw
-    draw=ImageDraw.Draw(img);draw.rectangle([0,0,min(img.width,len(label)*7+12),20],fill=(255,255,255))
-    draw.text((6,4),label,fill=(17,17,17))
-    return img
-
-kinds=(["S2"] if smoke_enabled else [])+list(selected)
-with st.expander("🎞 Timeline player — drag the bar or press Play to watch the AOI change day by day",expanded=True):
-    if not kinds:
-        st.info("Select a layer first.")
-    else:
-        tl_kind=st.selectbox("Layer",kinds,key="tl_kind_"+signature,
-            format_func=lambda k:"Sentinel-2 · smoke candidates (red)" if k=="S2" else ALL_PRODUCTS[k]["label"])
-        avail=[str(d) for d in days if tl_ok(tl_kind,d)]
-        if len(avail)<2:
-            st.info("Prepare all 30 days first. At least two days with valid data are needed for the player.")
-        else:
-            tl_key="tl_frame_"+signature+tl_kind
-            if st.session_state.get(tl_key) not in avail:st.session_state[tl_key]=avail[-1]
-            tl_day=st.select_slider("Day",options=avail,key=tl_key)
-            speed=st.slider("Play speed (seconds per frame)",0.1,2.0,0.5,0.1,key="tl_speed_"+signature)
-            play=st.button("▶ Play from selected day",key="tl_play_"+signature)
-            frame_slot=st.empty()
-            if tl_kind!="S2":
-                st.image(colorbar_png(*fixed_limits(tl_kind,config),ALL_PRODUCTS[tl_kind]["cmap"],ALL_PRODUCTS[tl_kind]["unit"]),use_container_width=True)
-                st.caption("Same fixed colour scale on every day, so changes between frames are real changes. Missing pixels stay grey.")
-            if play:
-                for one in avail[avail.index(tl_day):]:
-                    frame_slot.image(tl_frame(tl_kind,date.fromisoformat(one)),use_container_width=True)
-                    time.sleep(speed)
-            else:
-                frame_slot.image(tl_frame(tl_kind,date.fromisoformat(tl_day)),use_container_width=True)
+navleft,navmid,navright=st.columns([1,5,1])
+navleft.button("◀ Previous day",key="bottom_previous",on_click=move_day,args=(-1,),use_container_width=True)
+navmid.markdown(f"### Selected UTC day: {day}")
+navright.button("Next day ▶",key="bottom_next",on_click=move_day,args=(1,),use_container_width=True)
 if not record.get("s2") and not record["products"]:
     if record["errors"]:
         st.error("No layer completed for this date. Exact errors are shown below.")
@@ -1235,21 +1232,25 @@ else:
                 bands,profile,inside=read_s2(item["path"],config["aoi"])
                 result=smoke_screen(bands,day,params)
                 m1,m2,m3,m4=st.columns(4)
-                m1.metric("30-day image-context coverage",f"{item['coverage']:.1f}%")
-                m2.metric("Same-day assessable coverage",f"{item['current_coverage']:.1f}%")
+                m1.metric("Selected-day raw observation coverage",f"{item.get('raw_same_day_coverage',item['coverage']):.1f}%")
+                m2.metric("Same-day method-assessable coverage",f"{item['current_coverage']:.1f}%")
                 m3.metric("Same-day candidate area",f"{item['current_area']:.2f} km²" if item["current_area"] is not None else "No same-day data")
-                m4.metric("Older-context candidate area",finite_text(item.get("historical_area"))+" km²")
-                st.caption("Red = same-day spectral candidates. Amber = candidates on older observations, NOT smoke confirmed on the selected day. Map background is geographic context, not invented satellite imagery.")
+                m4.metric("Screening method",params["method"])
+                st.json(item.get("diagnostics",{}))
+                if item["current_coverage"]<20:st.warning("LOW ASSESSABLE COVERAGE: this result cannot establish absence of smoke across the AOI.")
+                if item["current_area"] is None:st.error("No method-assessable pixels. Smoke status UNKNOWN, not zero.")
+                elif item["current_pixels"]==0:st.info("No candidates in method-assessable pixels only. This does not establish absence of smoke.")
+                st.caption("Red = same-day experimental anomaly candidates, NOT confirmed smoke. Missing or unassessable pixels do not mean clean air.")
                 if item["coverage"]>0 and 100*(1-item["quality_coverage"]/item["coverage"])>cloud_warning:
                     st.warning("Cloud/quality-masked fraction exceeds the selected warning threshold; those pixels are not assumed smoke-free.")
                 if item["coverage"]<99:
-                    st.warning(f"Even the automatic 30-day context has only {item['coverage']:.1f}% observed coverage. Remaining locations have no returned S2 observation; changing a reference cannot create those measurements.")
+                    st.warning(f"The selected-day retrieval has only {item['coverage']:.1f}% observed coverage. Remaining locations have no returned selected-day S2 observation.")
                 if item["current_coverage"]<99:
-                    st.info("The image is a last-known-observation mosaic, not a single-date photograph. Older pixels improve geographic context only; current-day smoke metrics exclude them.")
+                    st.info("Only selected-day observations are shown. Unobserved, quality-masked or baseline-unmatched areas are unknown; no older image replaces them.")
                 show_history=st.checkbox("Show older-observation candidate context in amber",value=False,key="history_"+signature)
                 fmap=new_result_map(config["aoi"])
                 rgba=rgb_rgba(bands,inside)
-                show_rgb=st.checkbox("Show S2 RGB background (optional)",value=False,key="rgb_"+signature)
+                show_rgb=st.checkbox("Show selected-day S2 RGB",value=True,key="rgb_"+signature)
                 add_raster(fmap,rgba,profile,"S2 actual observation context (optional)",show=show_rgb)
                 unknown=inside & ~result["observed"]
                 hatch=np.zeros((*unknown.shape,4),dtype=np.uint8)
@@ -1267,7 +1268,7 @@ else:
                 with st.expander("Observation age and smoke-screen diagnostics"):
                     st.json(item.get("context",{}))
                     st.image(colorbar_png(0,29,"viridis_r","Observation age · days"),use_container_width=True)
-                    st.caption(f"Nominal grid spacing: {grid['res']} m. Index=(B03−B11)/(B03+B11). Water is not globally excluded. Clouds, haze, glint and bright surfaces can create false positives; dark smoke can be missed.")
+                    st.caption(f"Nominal requested grid: {grid['res']} m; not native 20 m detail. Method: {params['method']}. Both methods are experimental and require independent inspection.")
                     st.caption(f"Same-day assessed pixels: {item['current_assessable_pixels']:,}; same-day candidate pixels: {item['current_pixels']:,}.")
                 if item.get("candidate_fraction",0)>0.50:
                     st.warning("More than half of assessable context pixels were flagged: probable water/haze/cloud/surface contamination. This is not confirmed smoke coverage.")
@@ -1344,7 +1345,7 @@ else:
         st.caption("Enable individual layers in the map control. Each product has its own unit and fixed colour scale; overlapping colours are not a combined pollution index.")
 
 with st.expander("Download catalogue + request diagnostic report"):
-    st.download_button("⬇ Diagnostic JSON",json.dumps({"app_version":"v10.0-available","config":config,"day_record":record},ensure_ascii=False,indent=2,default=str),
+    st.download_button("⬇ Diagnostic JSON",json.dumps({"app_version":"v12.0-same-day-manual","config":config,"day_record":record},ensure_ascii=False,indent=2,default=str),
         file_name=f"{day}_catalogue_diagnostics.json",mime="application/json",key="diagnostic_json")
 
 st.markdown('<div class="section-label">05 · DAILY CURVES & DOWNLOADS</div>',unsafe_allow_html=True)
