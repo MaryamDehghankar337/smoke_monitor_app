@@ -34,7 +34,7 @@ STAC_URL="https://stac.dataspace.copernicus.eu/v1/"
 CATALOG_URL="https://sh.dataspace.copernicus.eu/catalog/v1/search"
 TOKEN_URL="https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 PROCESS_URL="https://sh.dataspace.copernicus.eu/api/v1/process"
-CACHE_DIR=Path.home()/".smoke_dashboard_v15_final"
+CACHE_DIR=Path.home()/".smoke_dashboard_v16_final"
 RESULT_DIR=CACHE_DIR/"sessions"
 CACHE_DIR.mkdir(parents=True,exist_ok=True)
 RESULT_DIR.mkdir(parents=True,exist_ok=True)
@@ -701,7 +701,7 @@ def request_s5(day,product,config,force=False,qa_override=None):
     if qa_override is not None:qa=qa_override
     payload={"input":{"bounds":{"bbox":list(bounds),"properties":{"crs":"http://www.opengis.net/def/crs/EPSG/0/4326"}},
         "data":[{"type":"sentinel-5p-l2","dataFilter":{"timeRange":{
-            "from":str(day)+"T00:00:00Z","to":str(day)+"T23:59:59Z"},"mosaickingOrder":"mostRecent"},
+            "from":str(day-timedelta(days=int(config.get("s5_window_days",1))-1))+"T00:00:00Z","to":str(day)+"T23:59:59Z"},"mosaickingOrder":"mostRecent"},
             "processing":{"minQa":qa,"upsampling":"NEAREST"}}]},
         "output":{"width":w,"height":h,"responses":[{"identifier":"default","format":{"type":"image/tiff"}}]},
         "evalscript":s5_script(ALL_PRODUCTS[product]["band"])}
@@ -1069,11 +1069,13 @@ with st.expander("Processing settings — appearance and geographic tools are re
     background_km=q3.slider("Local-background window (km)",10,80,30,5)
     min_pixels=st.number_input("Minimum connected candidate pixels",min_value=1,max_value=1000,value=4,step=1)
     resolution=st.selectbox("Requested S2 grid spacing (m)",[20,60,100,250,500,1000],index=3)
+    s5_window_days=st.selectbox("Sentinel-5P time window (days ending on selected date)",[1,3,7,14],index=0,
+        help="1 = selected UTC day only. Longer windows show the most recent QA-valid retrieval per pixel; older pixels are not same-day measurements.")
     medium=st.checkbox("Include SCL medium-probability cloud pixels (dense smoke may be classified as cloud; more false positives)",value=False)
     qa_override=st.checkbox("Override official S5P QA defaults",value=False)
     qa=st.slider("S5P QA (%) when override enabled",0,100,50)
     threshold=.1;brightness=.1;swir_ratio=1.6;smooth=2.0;dilation=1
-    st.caption("Image shown: past-only mosaic (previous 30 days, up to 7 acquisitions) so the whole AOI is visible. Smoke screening: selected-day pixels only, compared with their own local background; older pixels never count as selected-day smoke. Unvalidated screen.")
+    st.caption("Image shown: past-only mosaic so the whole AOI is visible; seams are boundaries between acquisition dates (see Observation-age layer). Smoke screening uses selected-day pixels only. Unvalidated screen.")
 region=shape(ensure_aoi(st.session_state.aoi))
 if region.bounds[2]-region.bounds[0]>30 or region.bounds[3]-region.bounds[1]>30:
     st.warning("Please draw a regional AOI (under 30° span in longitude/latitude). This dashboard is not a global processing service.")
@@ -1081,8 +1083,8 @@ if region.bounds[2]-region.bounds[0]>30 or region.bounds[3]-region.bounds[1]>30:
 grid=grid_for(ensure_aoi(st.session_state.aoi),resolution)
 params={"threshold":float(threshold),"min_pixels":int(min_pixels),"dilation":int(dilation),
         "brightness":brightness,"swir_ratio":swir_ratio,"smooth":smooth,"medium_cloud":medium,"min_blue_excess":min_blue,"z_min":z_min,"background_km":background_km,"res_m":grid["res"],"smooth_px":3,"max_brightness":.45}
-config={"version":"v15.0-full-mosaic-same-day-detection","aoi":ensure_aoi(st.session_state.aoi),"start":str(start),"end":str(end),
-        "products":selected,"smoke":smoke_enabled,"params":params,"qa_override":qa_override,"qa":qa,"grid":grid,
+config={"version":"v16.0-full-mosaic-same-day-detection","aoi":ensure_aoi(st.session_state.aoi),"start":str(start),"end":str(end),
+        "products":selected,"s5_window_days":int(s5_window_days),"smoke":smoke_enabled,"params":params,"qa_override":qa_override,"qa":qa,"grid":grid,
         "cloud_warning":cloud_warning}
 if st.session_state.get("cdse_auth") and (smoke_enabled or selected):
     availability_key="availability_"+fingerprint(config)
@@ -1106,10 +1108,6 @@ if st.session_state.get("cdse_auth") and (smoke_enabled or selected):
             elif not latest:
                 st.warning("No catalogue source was found in the checked 180-day lookback. Data availability is not established; no measurements will be invented.")
                 if latest_errors:st.caption(" | ".join(latest_errors))
-    availability_errors={k:v["error"] for k,v in availability.items() if not v["ok"]}
-    if availability_errors:
-        st.warning("Availability search failed for some sources. This is a catalogue/network failure, NOT proof that imagery is absent.")
-        st.json(availability_errors)
     if st.button("🔄 Refresh actual source dates",key="refresh_catalogue"):
         with st.spinner("Refreshing catalogue…"):
             st.session_state[availability_key]=availability_for(config,force=True)
@@ -1213,7 +1211,7 @@ else:
                     st.json(item.get("diagnostics",{}))
                 if item["current_area"] is None:st.warning("The mosaic is shown for context, but no selected-day pixel could be screened. Smoke status UNKNOWN, not absent.")
                 elif item["current_pixels"]==0:st.info("No candidates among screened selected-day pixels only; this does not establish absence elsewhere.")
-                st.caption("Red = selected-day haze-screen candidates (unvalidated), NOT confirmed smoke. The RGB is a past-only mosaic for context; use the Observation-age layer to see which pixels are older. Older pixels are never screened as selected-day smoke.")
+                st.caption("Red = selected-day haze-screen candidates (unvalidated), NOT confirmed smoke. The RGB is a past-only mosaic; visible seams are boundaries between acquisition dates (see Observation-age layer). Older pixels are never screened as selected-day smoke.")
                 if item["coverage"]>0 and 100*(1-item["quality_coverage"]/item["coverage"])>cloud_warning:
                     st.warning("Cloud/quality-masked fraction exceeds the selected warning threshold; those pixels are not assumed smoke-free.")
                 if item["coverage"]<99:
@@ -1223,7 +1221,7 @@ else:
                 show_history=False
                 fmap=new_result_map(config["aoi"])
                 rgba=rgb_rgba(bands,inside)
-                show_rgb=st.checkbox("Show full-AOI S2 RGB mosaic (past-only; older pixels flagged by age layer)",value=True,key="rgb_"+signature)
+                show_rgb=st.checkbox("Show full-AOI S2 RGB mosaic (past-only)",value=True,key="rgb_"+signature)
                 add_raster(fmap,rgba,profile,"S2 RGB mosaic (past-only context)",show=show_rgb)
                 unknown=inside & ~result["observed"]
                 hatch=np.zeros((*unknown.shape,4),dtype=np.uint8)
@@ -1234,12 +1232,7 @@ else:
                 if show_history:add_raster(fmap,mask_rgba(result["historical"],(245,158,11)),profile,"OLDER spectral candidates (not current-day smoke)")
                 add_raster(fmap,mask_rgba(result["current"],(230,57,70)),profile,"SELECTED-DAY haze-screen candidates (unvalidated)")
                 ages=field_rgba(result["age"],[0,29],"viridis_r",200)
-                older=inside & result["observed"] & (result["age"]>=1)
-                hatch_old=np.zeros((*older.shape,4),dtype=np.uint8)
-                rr2,cc2=np.indices(older.shape)
-                hatch_old[older & (((rr2-cc2)%14)<2)]=[255,255,255,150]
-                add_raster(fmap,hatch_old,profile,"Pixels older than selected day (white hatch)",show=False)
-                add_raster(fmap,ages,profile,"Observation age (0–29 days)",show=False)
+                add_raster(fmap,ages,profile,"Observation age (0–29 days) — shows date seams",show=False)
                 add_raster(fmap,field_rgba(np.where(result["observed"],result["index"],np.nan),[-1,1],"inferno"),profile,"Blue-excess score (not smoke probability)",show=False)
                 finish_map(fmap,config["aoi"],"smoke_map_"+signature+str(day),height=620)
                 st.markdown('<span class="result-chip">🔴 Selected-day candidate</span><span class="result-chip">▧ No S2 observation / unknown</span>',unsafe_allow_html=True)
@@ -1287,11 +1280,11 @@ else:
                 qa_used=0 if explore else (qa if qa_override else (75 if product=="NO2" else 50))
                 m3.metric("Quality threshold",f"QA ≥ {qa_used}%")
                 if product=="CH4":st.info("CH4 is the column-averaged dry-air methane mixing ratio (XCH4), not a surface concentration or emission rate. Data gaps, including over water, remain unknown.")
-                st.caption(f"Calendar-day retrievals: {day}, UTC. Actual acquisition times need not match S2. No spatial or temporal gap filling is used for S5P measurements.")
+                st.caption(f"Calendar-day retrievals: {day}, UTC. Actual acquisition times need not match S2. No spatial or temporal gap filling is used for S5P measurements." if s5_window_days==1 else f"Latest QA-valid retrieval per pixel within {s5_window_days} days ending {day} (UTC). Pixels from earlier days are not same-day measurements; no interpolation is used.")
                 if layer["mean"] is None:
-                    st.warning("A catalogue source exists, but Process API returned no valid pixels at this AOI/date/QA. No empty basemap is shown as a pollution result.")
-                    st.json({k:v for k,v in layer.items() if k!="path"})
-                    st.download_button("⬇ Original API TIFF for inspection",Path(layer["path"]).read_bytes(),file_name=f"{day}_{product}_api.tif",mime="image/tiff",key="raw_empty_"+product)
+                    st.info(f"{meta['label']}: no QA-valid Sentinel-5P pixel in this AOI for the {s5_window_days}-day window ending {day} (UTC). Unknown is not zero. Methane needs mostly clear-sky scenes and the latest day may not be fully published; widen the Sentinel-5P time window in Processing settings or choose another date.")
+                    fmap=new_result_map(config["aoi"])
+                    finish_map(fmap,config["aoi"],"s5_empty_"+signature+product+str(day),height=480)
                     continue
                 limits=fixed_limits(product,config)
                 rgba=field_rgba(values,limits,meta["cmap"])
@@ -1323,7 +1316,7 @@ else:
         st.caption("Enable individual layers in the map control. Each product has its own unit and fixed colour scale; overlapping colours are not a combined pollution index.")
 
 with st.expander("Download catalogue + request diagnostic report"):
-    st.download_button("⬇ Diagnostic JSON",json.dumps({"app_version":"v15.0-full-mosaic-same-day-detection","config":config,"day_record":record},ensure_ascii=False,indent=2,default=str),
+    st.download_button("⬇ Diagnostic JSON",json.dumps({"app_version":"v16.0-full-mosaic-same-day-detection","config":config,"day_record":record},ensure_ascii=False,indent=2,default=str),
         file_name=f"{day}_catalogue_diagnostics.json",mime="application/json",key="diagnostic_json")
 
 st.markdown('<div class="section-label">05 · DAILY CURVES & DOWNLOADS</div>',unsafe_allow_html=True)
