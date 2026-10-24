@@ -26,6 +26,9 @@ from shapely.ops import unary_union
 from scipy.ndimage import gaussian_filter, binary_dilation, label
 from skimage.morphology import disk
 from PIL import Image
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -34,7 +37,7 @@ STAC_URL="https://stac.dataspace.copernicus.eu/v1/"
 CATALOG_URL="https://sh.dataspace.copernicus.eu/catalog/v1/search"
 TOKEN_URL="https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 PROCESS_URL="https://sh.dataspace.copernicus.eu/api/v1/process"
-CACHE_DIR=Path.home()/".smoke_dashboard_v10_available"
+CACHE_DIR=Path.home()/".smoke_dashboard_v13_supervised"
 RESULT_DIR=CACHE_DIR/"sessions"
 CACHE_DIR.mkdir(parents=True,exist_ok=True)
 RESULT_DIR.mkdir(parents=True,exist_ok=True)
@@ -261,7 +264,7 @@ def create_map(aoi, search_center=None, search_zoom=6):
 
     if not search_center:
         west,south,east,north=geometry.bounds
-        dx=(east-west)*0.18;dy=(north-south)*0.18
+        dx=(east-west)*.18;dy=(north-south)*.18
         fmap.fit_bounds([[south-dy,west-dx],[north+dy,east+dx]],max_zoom=9)
     return fmap
 
@@ -539,75 +542,12 @@ def merge_daily(existing,incoming,day,medium=False):
     return existing
 
 
-def request_s2_context(day,config,force=False,status=None):
-    key=fingerprint(["s2-catalogued-mosaic-v10",day,config["aoi"],config["grid"],config["params"]["medium_cloud"]])
-    path=CACHE_DIR/(key+".tif")
-    if path.exists() and not force:return path
-    notes=[]
-    try:
-        dates=catalogue_dates("sentinel-2-l2a",config["aoi"],day-timedelta(days=29),day)
-        selected=sorted(dates,reverse=True)[:7]
-    except Exception as exc:
-        # Unlike v9, a catalogue failure does not stop all older-day attempts.
-        notes.append("Catalogue failed. Bounded daily fallback used: "+str(exc))
-        selected=[day-timedelta(days=n) for n in range(7)]
-    if not selected:
-        raise RuntimeError("Catalogue search completed but found no S2 acquisition in the preceding 30 days for this AOI.")
-    merged=None;profile=None;used=[];failures=[];consecutive_failures=0
-    for candidate in selected:
-        if status is not None:status.caption(f"S2 · source acquisition {candidate}")
-        try:
-            daily=request_s2_day(candidate,config,force=force)
-            with rasterio.open(daily) as ds:
-                array=ds.read().astype(np.float32)
-                if profile is not None and (ds.crs!=profile["crs"] or ds.transform!=profile["transform"]):
-                    raise ValueError("S2 CRS/transform mismatch")
-                profile=ds.profile.copy()
-            merged=merge_daily(merged,array,day,config["params"]["medium_cloud"])
-            used.append(str(candidate));consecutive_failures=0
-            inside=clip_mask(profile,*merged.shape[1:],config["aoi"])
-            reject=[0,1,3,9,10,11] if config["params"]["medium_cloud"] else [0,1,3,8,9,10,11]
-            good=(merged[7]>.5)&inside&~np.isin(merged[6],reject)
-            if good.sum()/max(1,inside.sum())>=0.98:break
-        except Exception as exc:
-            failures.append(f"{candidate}: {exc}")
-            consecutive_failures+=1
-            if consecutive_failures>=2:
-                notes.append("Stopped after two consecutive source request failures; retry is available.")
-                break
-    if merged is None:raise RuntimeError("Every S2 source request failed: "+" | ".join(failures))
-    prof=profile.copy();prof.update(count=9,dtype="float32",nodata=-9999,compress="deflate",tiled=False)
-    tmp=path.with_suffix(".tif.part")
-    try:
-        with rasterio.open(tmp,"w",**prof) as ds:ds.write(merged)
-        tmp.replace(path)
-    finally:tmp.unlink(missing_ok=True)
-    atomic_json(path.with_suffix(".context.json"),{"used_dates":used,"notes":notes,"source_failures":failures,
-        "catalogue":CATALOG_URL,"method":"daily requests + acquisition-date preserving mosaic","max_acquisition_days":7})
-    return path
-
-
 def request_s2(day,config,force=False,status=None):
-    if status is not None:status.caption(f"S2 · actual selected UTC day {day}; no historical substitution")
-    daily=request_s2_day(day,config,force=force)
-    key=fingerprint(["same-day-v12",str(day),config["aoi"],config["grid"],config["params"]])
-    target=CACHE_DIR/(key+".tif")
-    import shutil
-    if force or not target.exists():shutil.copyfile(daily,target)
-    notes=[]
-    baseline_path=target.with_suffix(".baseline.tif")
-    baseline_path.unlink(missing_ok=True) if force else None
-    if config["params"].get("method")=="temporal" and not baseline_path.exists():
-        try:
-            baseline_config={**config,"params":dict(config["params"])}
-            source=request_s2_context(day-timedelta(days=1),baseline_config,force=False,status=status)
-            shutil.copyfile(source,baseline_path)
-        except Exception as exc:notes.append("Historical comparison unavailable: "+str(exc))
-    atomic_json(target.with_suffix(".context.json"),{
-        "used_dates":[str(day)],"notes":notes,"source_failures":[],
-        "method":"Selected-day retrieval only. Baseline is comparison only, never substituted.",
-        "baseline_path":str(baseline_path) if baseline_path.exists() else None})
-    return target
+    if status is not None:status.caption(f"Selected-day S2 retrieval: {day}; no temporal filling")
+    path=request_s2_day(day,config,force)
+    atomic_json(path.with_suffix(".context.json"),{"used_dates":[str(day)],
+        "method":"Selected UTC day only; no historical substitution", "notes":[],"source_failures":[]})
+    return path
 
 def read_s2(path,aoi):
     with rasterio.open(path) as ds:
@@ -619,12 +559,6 @@ def read_s2(path,aoi):
     bands["dataMask"]=observed.astype(np.float32)
     for key in BANDS:
         if key!="dataMask":bands[key][~observed]=np.nan
-    comparison=Path(path).with_suffix(".baseline.tif")
-    if comparison.exists():
-        with rasterio.open(comparison) as ds:
-            if ds.shape==array.shape[1:] and ds.transform==profile["transform"] and ds.crs==profile["crs"]:
-                ref=ds.read().astype(np.float32)
-                bands["baseline"]=ref
     return bands,profile,inside
 
 
@@ -633,68 +567,79 @@ def nd(a,b):
     return np.divide(a-b,total,out=np.full_like(a,np.nan),where=np.isfinite(total)&(np.abs(total)>1e-6))
 
 
+FEATURE_NAMES=["B02","B03","B04","B08","B11","B12","NDVI","NDWI","MNDWI","NDSWIR","visible_mean","visible_std","blue_red_ratio"]
+CLASS_NAMES=["smoke","cloud","shadow","water","land"]
+
+def classifier_features(bands):
+    b,g,r,n,s1,s2=[bands[k] for k in BANDS[:6]]
+    safe=lambda a,c:np.divide(a,c,out=np.full_like(a,np.nan),where=np.abs(c)>1e-6)
+    arrays=[b,g,r,n,s1,s2,nd(n,r),nd(g,n),nd(g,s1),nd(s1,s2),(b+g+r)/3,
+        np.std(np.stack([b,g,r]),axis=0),safe(b,r)]
+    return np.stack(arrays,axis=-1)
+
+def training_identity(frame):
+    return hashlib.sha256(frame.to_csv(index=False).encode()).hexdigest()[:24]
+
+def fit_supervised(frame):
+    required=FEATURE_NAMES+["label","group"]
+    missing=[c for c in required if c not in frame]
+    if missing:raise ValueError("Missing training columns: "+", ".join(missing))
+    data=frame[required].copy()
+    data["label"]=data["label"].astype(str).str.strip().str.lower()
+    data[FEATURE_NAMES]=data[FEATURE_NAMES].apply(pd.to_numeric,errors="coerce")
+    valid=np.isfinite(data[FEATURE_NAMES].to_numpy()).all(axis=1)&data["group"].notna()&data["label"].isin(CLASS_NAMES)
+    data=data.loc[valid].reset_index(drop=True)
+    if set(data["label"])!=set(CLASS_NAMES):raise ValueError("Training requires all five classes: smoke, cloud, shadow, water, land.")
+    if data["group"].nunique()<4:raise ValueError("Use at least four independent scene/site groups; random adjacent-pixel splitting is not accepted.")
+    counts=data["label"].value_counts()
+    if counts.min()<30:raise ValueError("At least 30 valid samples per class are required to fit this prototype; this does not guarantee accuracy.")
+    X=data[FEATURE_NAMES].to_numpy(dtype=np.float32);y=data["label"].to_numpy();groups=data["group"].astype(str).to_numpy()
+    chosen=None
+    splitter=GroupShuffleSplit(n_splits=100,test_size=.25,random_state=42)
+    for tr,te in splitter.split(X,y,groups):
+        if set(y[tr])==set(CLASS_NAMES) and set(y[te])==set(CLASS_NAMES):chosen=(tr,te);break
+    if chosen is None:raise ValueError("Could not hold out independent groups containing every class. Add more independent labelled scenes.")
+    tr,te=chosen
+    model=RandomForestClassifier(n_estimators=200,min_samples_leaf=5,max_features="sqrt",class_weight="balanced_subsample",random_state=42,n_jobs=2)
+    model.fit(X[tr],y[tr]);pred=model.predict(X[te])
+    report=classification_report(y[te],pred,labels=CLASS_NAMES,output_dict=True,zero_division=0)
+    return {"model":model,"report":report,"confusion":confusion_matrix(y[te],pred,labels=CLASS_NAMES).tolist(),
+        "train_groups":sorted(set(groups[tr])),"test_groups":sorted(set(groups[te])),
+        "training_hash":training_identity(frame),"n_train":len(tr),"n_test":len(te),
+        "feature_names":FEATURE_NAMES,"classes":CLASS_NAMES,
+        "note":"Model fitted on training groups only. Held-out results are preliminary, not external validation; probabilities are uncalibrated."}
+
 def smoke_screen(bands,day,params):
-    b,g,r,n,sw1,sw2=[bands[k] for k in BANDS[:6]]
-    observed=bands["dataMask"]>0.5
-    scl=np.nan_to_num(bands["SCL"],nan=0).astype(np.int32)
-    invalid=[0,1,3,9,10,11] if params["medium_cloud"] else [0,1,3,8,9,10,11]
-    finite=np.logical_and.reduce([np.isfinite(bands[k]) for k in BANDS[:6]])
+    observed=bands["dataMask"]>.5
+    scl=np.nan_to_num(bands["SCL"],nan=0).astype(np.int16)
     age=(day-EPOCH).days-bands["observation_day"]
-    same=observed & np.isfinite(age) & (age>=0)&(age<1)
-    quality=observed & ~np.isin(scl,invalid)&finite
-    fresh=quality&same
-    water=(scl==6)|((nd(g,n)>0)&(n<0.20))
-    eligible=fresh & (~water if params.get("exclude_water",False) else True)
-    index=nd(g,sw1)
-    diagnostic={"raw_same_day_pixels":int(same.sum()),
-        "removed_cloud_shadow_invalid":int((same&~quality).sum()),
-        "quality_same_day_pixels":int(fresh.sum()),
-        "removed_by_water_option":int((fresh&~eligible).sum()),
-        "eligible_before_spectral_test":int(eligible.sum())}
-    comparable=np.zeros_like(observed)
-    score=index.copy()
-    if params.get("method")=="temporal":
-        baseline=bands.get("baseline")
-        candidate=np.zeros_like(observed)
-        if baseline is not None:
-            old_age=(day-EPOCH).days-baseline[8]
-            comparable=eligible&(baseline[7]>.5)&~np.isin(baseline[6],invalid)
-            comparable &= np.isfinite(baseline[:6]).all(axis=0)&(baseline[:6]!=-9999).all(axis=0)
-            comparable &= (old_age>=1)&(old_age<=params.get("baseline_days",10))
-            old_visible=baseline[:3].mean(axis=0)
-            visible=(b+g+r)/3
-            dark=old_visible-visible
-            relative=np.divide(dark,np.maximum(old_visible,0.02))
-            candidate=comparable&(dark>params.get("dark_drop",0.035))&(relative>params.get("relative_drop",0.25))
-            score=np.where(comparable,dark,np.nan)
-            diagnostic["baseline_age_min_days"]=float(old_age[comparable].min()) if comparable.any() else None
-            diagnostic["baseline_age_max_days"]=float(old_age[comparable].max()) if comparable.any() else None
-        diagnostic["comparable_pixels"]=int(comparable.sum())
-        assessable=comparable
-    else:
-        bright=(b+g+r)/3
-        ratio=np.divide(sw2,sw1,out=np.full_like(sw1,np.nan),where=sw1>1e-6)
-        candidate=eligible&(index>params["threshold"])&(bright>params["brightness"])&(ratio<params["swir_ratio"])&(nd(n,r)<0.45)
-        assessable=eligible
-    diagnostic["spectral_candidates_before_filtering"]=int(candidate.sum())
-    if params["smooth"]>0 and candidate.any():
-        weights=gaussian_filter(assessable.astype(np.float32),sigma=params["smooth"])
-        values=gaussian_filter(np.where(assessable,np.nan_to_num(score),0),sigma=params["smooth"])
-        smoothed=np.divide(values,weights,out=np.full_like(values,np.nan),where=weights>0.05)
-        cutoff=params.get("dark_drop",0.035) if params.get("method")=="temporal" else params["threshold"]
-        candidate &= smoothed>cutoff
-    components,count=label(candidate,structure=np.ones((3,3)))
-    sizes=np.bincount(components.ravel(),minlength=count+1)
-    keep=np.flatnonzero(sizes>=params["min_pixels"]);keep=keep[keep>0]
-    smoke=np.isin(components,keep)&assessable
-    diagnostic["after_component_filter"]=int(smoke.sum())
-    if params["dilation"] and smoke.any():
-        smoke=binary_dilation(smoke,structure=disk(params["dilation"]))&assessable
-    diagnostic["final_candidate_pixels"]=int(smoke.sum())
-    diagnostic["method"]=params.get("method","legacy")
-    return {"observed":observed,"quality":quality,"smoke":smoke,"fresh":assessable,
-        "current":smoke,"historical":np.zeros_like(smoke),"age":np.where(observed,age,np.nan),
-        "index":index,"score":score,"diagnostics":diagnostic}
+    same=observed&np.isfinite(age)&(age>=0)&(age<1)
+    cube=classifier_features(bands)
+    valid=same&np.isfinite(cube).all(axis=-1)&~np.isin(scl,[0,1,11])
+    probability=np.full(observed.shape,np.nan,dtype=np.float32)
+    smoke=np.zeros_like(observed);assessable=np.zeros_like(observed)
+    bundle=st.session_state.get("supervised_bundle")
+    trained=bool(bundle and bundle.get("training_hash")==params.get("model_hash"))
+    if trained and valid.any():
+        positions=np.flatnonzero(valid.ravel());flat=cube.reshape(-1,len(FEATURE_NAMES))
+        model=bundle["model"];smoke_id=list(model.classes_).index("smoke")
+        assessable=valid.copy();pflat=probability.ravel();sflat=smoke.ravel()
+        for start in range(0,len(positions),40000):
+            ids=positions[start:start+40000];probs=model.predict_proba(flat[ids])
+            pflat[ids]=probs[:,smoke_id]
+            sflat[ids]=(np.argmax(probs,axis=1)==smoke_id)&(probs[:,smoke_id]>=params.get("smoke_probability",.90))
+        components,count=label(smoke,structure=np.ones((3,3)))
+        sizes=np.bincount(components.ravel(),minlength=count+1)
+        keep=np.flatnonzero(sizes>=params["min_pixels"]);keep=keep[keep>0]
+        smoke=np.isin(components,keep)&assessable
+    diagnostic={"raw_same_day_pixels":int(same.sum()),"usable_feature_pixels":int(valid.sum()),
+        "model_assessable_pixels":int(assessable.sum()),"final_candidate_pixels":int(smoke.sum()),
+        "model_available":trained,"model_hash":params.get("model_hash"),
+        "probability_threshold":params.get("smoke_probability",.90),
+        "note":"Cloud/shadow/water are model classes, not automatically discarded. No model means UNKNOWN. Model probabilities are uncalibrated scores."}
+    return {"observed":observed,"quality":valid,"smoke":smoke,"fresh":assessable,"current":smoke,
+        "historical":np.zeros_like(smoke),"age":np.where(observed,age,np.nan),
+        "index":probability,"diagnostics":diagnostic}
 
 def s5_script(band):
     return """//VERSION=3
@@ -809,14 +754,12 @@ def finish_map(fmap,aoi,key,height=580):
     folium.GeoJson(aoi,name="Selected AOI",style_function=lambda _: {"color":"#457b9d","weight":2,"fill":False}).add_to(fmap)
     folium.LayerControl(collapsed=False).add_to(fmap)
     west,south,east,north=g.bounds
-    dx=max((east-west)*0.18,0.01);dy=max((north-south)*0.18,0.01)
+    dx=max(.01,(east-west)*.18);dy=max(.01,(north-south)*.18)
     fmap.fit_bounds([[south-dy,west-dx],[north+dy,east+dx]],padding=(35,35),max_zoom=9)
-    from folium.plugins import Fullscreen
-    Fullscreen().add_to(fmap)
     if st.button("⌖ Show whole AOI",key="reset_"+key):
-        st.session_state["map_reset_"+key]=st.session_state.get("map_reset_"+key,0)+1
+        st.session_state["reset_map_"+key]=st.session_state.get("reset_map_"+key,0)+1
     MousePosition(position="bottomright",prefix="Lat/Lon",num_digits=5).add_to(fmap)
-    st_folium(fmap,key=key+"_view_"+str(st.session_state.get("map_reset_"+key,0)),height=height,use_container_width=True,returned_objects=[])
+    st_folium(fmap,key=key+str(st.session_state.get("reset_map_"+key,0)),height=height,use_container_width=True,returned_objects=[])
 
 
 def package_png(rgba,profile):
@@ -861,14 +804,13 @@ def process_day(day,config,status=None,retry=False):
             record["s2"]={"path":str(path),"coverage":float(result["observed"].sum()/denom*100),
                 "quality_coverage":float(result["quality"].sum()/denom*100),
                 "current_coverage":float(result["fresh"].sum()/denom*100),
-                "raw_same_day_coverage":float(result["diagnostics"]["raw_same_day_pixels"]/denom*100),
                 "current_area":float((result["current"]*pixel_area).sum()) if result["fresh"].any() else None,
                 "historical_area":None,"diagnostics":result["diagnostics"],
                 "current_pixels":int(result["current"].sum()),"observed_pixels":int(result["observed"].sum()),
                 "current_assessable_pixels":int(result["fresh"].sum()),
                 "candidate_fraction":float(result["smoke"].sum()/max(1,result["quality"].sum())),
                 "context":json.loads(context_path.read_text()) if context_path.exists() else {},
-                "status":"same-day observed" if result["fresh"].any() else "older context only" if result["observed"].any() else "no valid returned image"}
+                "status":"model-assessable same-day observation" if result["fresh"].any() else "unassessed: no model or usable features" if result["observed"].any() else "no valid returned image"}
             record["errors"].pop("S2",None);record["tracebacks"].pop("S2",None)
         except Exception as exc:
             record.pop("s2",None);record["errors"]["S2"]=str(exc);record["tracebacks"]["S2"]=traceback.format_exc()
@@ -979,10 +921,8 @@ st.markdown("""<style>
 st.markdown("""<style>
 .stApp .stButton>button:not([kind="primary"]),.stApp .stDownloadButton button,
 .stApp button[data-testid="stBaseButton-secondary"],.stApp a[data-testid="stBaseLinkButton-secondary"]{
- background:#fff!important;color:#111!important;-webkit-text-fill-color:#111!important;border:1.5px solid #457b9d!important;opacity:1;}
-.stApp .stButton>button:not([kind="primary"]) *,.stApp .stDownloadButton button *,
-.stApp button[data-testid="stBaseButton-secondary"] *{color:#111!important;-webkit-text-fill-color:#111!important;}
-.stApp .stButton>button:not([kind="primary"]):hover{background:#a8dadc!important;}
+background:#fff!important;color:#111!important;-webkit-text-fill-color:#111!important;border:1.5px solid #457b9d!important;}
+.stApp .stButton>button:not([kind="primary"]) *,.stApp .stDownloadButton button *{color:#111!important;-webkit-text-fill-color:#111!important;}
 .stApp button:disabled{opacity:.55!important;}
 </style>""",unsafe_allow_html=True)
 st.markdown("""<div class="app-header"><div><div class="app-title">🛰️ Smoke & Methane Monitor</div>
@@ -1078,36 +1018,43 @@ with st.expander("Additional Sentinel-5P cloud-context fields",expanded=False):
     for i,(key,meta) in enumerate(CLOUD_PRODUCTS.items()):
         with context_cols[i%3]:
             if st.checkbox(meta["label"],key="product_"+key):selected.append(key)
+with st.expander("Smoke classifier — labelled data and independent-group evaluation",expanded=True):
+    st.warning("No pretrained smoke weights are bundled. Upload independently labelled training data to enable classification. Without training, RGB remains available but smoke status is UNKNOWN. A trained model still requires external validation.")
+    st.caption("Labels: smoke/cloud/shadow/water/land. Group must identify an independent scene or site, NOT an arbitrary row or adjacent pixel. Do not label smoke solely from event news.")
+    training_upload=st.file_uploader("Labelled feature CSV",type=["csv"],key="training_csv")
+    if training_upload is not None:
+        try:
+            training_frame=pd.read_csv(training_upload)
+            train_hash=training_identity(training_frame)
+            if st.button("Train and evaluate on held-out groups",key="train_classifier"):
+                with st.spinner("Training and independent-group holdout evaluation…"):
+                    st.session_state.supervised_bundle=fit_supervised(training_frame)
+        except Exception as exc:st.error(str(exc))
+    bundle=st.session_state.get("supervised_bundle")
+    if bundle:
+        st.dataframe(pd.DataFrame(bundle["report"]).T,use_container_width=True)
+        st.dataframe(pd.DataFrame(bundle["confusion"],index=CLASS_NAMES,columns=CLASS_NAMES),use_container_width=True)
+        st.caption("Confusion matrix: rows=true class, columns=predicted class. Metrics use the winning class, not the final thresholded/component-filtered mask.")
+        st.json({k:v for k,v in bundle.items() if k not in ["model","report","confusion"]})
+        if st.button("Remove trained model",key="clear_model"):
+            st.session_state.pop("supervised_bundle",None);st.rerun()
+    smoke_probability=st.slider("Smoke-class score threshold (NOT calibrated confidence)",0.50,0.99,0.90,0.01)
 with st.expander("Processing settings — appearance and geographic tools are retained",expanded=False):
-    p1,p2,p3=st.columns(3)
-    method_name=st.selectbox("Experimental screening method",["Temporal darkening — dark-plume candidates","Legacy green/SWIR — water-sensitive candidates"])
-    method="temporal" if method_name.startswith("Temporal") else "legacy"
-    st.warning("Neither method is a validated smoke classifier. Temporal darkening can flag cloud shadows, illumination changes, water/glint and surface change, and can miss pale smoke. Red is an anomaly candidate, NOT confirmed smoke.")
-    exclude_water=st.checkbox("Exclude water (can miss marine smoke)",value=False)
-    baseline_days=st.slider("Maximum comparison-pixel age (days)",1,29,10)
-    dark_drop=st.slider("Temporal absolute visible-reflectance decrease",0.005,0.20,0.035,0.005)
-    relative_drop=st.slider("Temporal relative visible decrease",0.05,0.90,0.25,0.05)
-    threshold=p1.number_input("Legacy green/SWIR threshold",min_value=-0.50,max_value=0.80,value=0.10,step=0.01)
-    min_pixels=p2.number_input("Minimum connected candidate pixels",min_value=2,max_value=1000,value=10,step=1)
-    dilation=p3.number_input("Final dilation radius",min_value=0,max_value=20,value=2,step=1)
-    p4,p5,p6=st.columns(3)
-    resolution=p4.selectbox("Requested S2 grid spacing (m)",[20,60,100,250,500,1000],index=3)
-    brightness=p5.slider("Minimum visible brightness",0.01,0.40,0.10,0.01)
-    swir_ratio=p6.slider("Maximum B12/B11 ratio",0.2,3.0,1.6,0.05)
-    smooth=st.slider("Smoke-index smoothing sigma (pixels)",0.0,6.0,2.0,0.5)
-    medium=st.checkbox("Include medium-cloud pixels in candidate screening (experimental)",value=False)
-    qa_override=st.checkbox("Override official S5P QA defaults",value=False)
+    min_pixels=st.number_input("Minimum connected candidate pixels",min_value=1,max_value=1000,value=3,step=1)
+    resolution=st.selectbox("Requested S2 grid spacing (m)",[20,60,100,250,500,1000],index=2)
+    threshold=0.1;brightness=0.1;swir_ratio=1.6;smooth=0.;medium=False;dilation=0
+    qa_override=st.checkbox("Override S5P QA defaults",value=False)
     qa=st.slider("S5P QA (%) when override enabled",0,100,50)
-    st.caption("Official defaults: NO2 75%, other fields 50%. Lowering QA increases coverage only where low-QA retrievals exist, at a quality cost. No fabricated values are inserted.")
-    st.caption("S2 analysis uses the selected UTC day only. In temporal mode an automatic past-only comparison is used, without replacing selected-day pixels. No matched baseline means unknown, not zero.")
+    st.caption("No dilation of smoke masks; clouds/shadows/water are classifier classes. Large AOIs coarsen output spacing. Training and prediction must use compatible reflectance preprocessing and resolution.")
 region=shape(ensure_aoi(st.session_state.aoi))
 if region.bounds[2]-region.bounds[0]>30 or region.bounds[3]-region.bounds[1]>30:
     st.warning("Please draw a regional AOI (under 30° span in longitude/latitude). This dashboard is not a global processing service.")
     st.stop()
 grid=grid_for(ensure_aoi(st.session_state.aoi),resolution)
 params={"threshold":float(threshold),"min_pixels":int(min_pixels),"dilation":int(dilation),
-        "brightness":brightness,"swir_ratio":swir_ratio,"smooth":smooth,"medium_cloud":medium,"method":method,"exclude_water":exclude_water,"baseline_days":baseline_days,"dark_drop":dark_drop,"relative_drop":relative_drop}
-config={"version":"v12.0-same-day-manual","aoi":ensure_aoi(st.session_state.aoi),"start":str(start),"end":str(end),
+        "brightness":brightness,"swir_ratio":swir_ratio,"smooth":smooth,"medium_cloud":medium,
+        "model_hash":st.session_state.get("supervised_bundle",{}).get("training_hash"),"smoke_probability":smoke_probability}
+config={"version":"v13.0-supervised-same-day","aoi":ensure_aoi(st.session_state.aoi),"start":str(start),"end":str(end),
         "products":selected,"smoke":smoke_enabled,"params":params,"qa_override":qa_override,"qa":qa,"grid":grid,
         "cloud_warning":cloud_warning}
 if st.session_state.get("cdse_auth") and (smoke_enabled or selected):
@@ -1154,17 +1101,14 @@ if not smoke_enabled and not selected:
 st.markdown('<div class="section-label">04 · 30-DAY EXPLORER</div>',unsafe_allow_html=True)
 days=[stamp.date() for stamp in pd.date_range(start,end)]
 options=[str(d) for d in days]
-slider_key="shared_date_"+fingerprint([config["aoi"],str(start),str(end)])
+slider_key="manual_date_"+fingerprint([config["aoi"],str(start),str(end)])
 if st.session_state.get(slider_key) not in options:st.session_state[slider_key]=preferred_catalogue_date(availability,end)
 def move_day(delta):
-    i=options.index(st.session_state[slider_key])
-    st.session_state[slider_key]=options[max(0,min(len(options)-1,i+delta))]
-cprev,cslider,cnext=st.columns([1,10,1])
-cprev.button("◀ Previous",on_click=move_day,args=(-1,),use_container_width=True)
-cnext.button("Next ▶",on_click=move_day,args=(1,),use_container_width=True)
-with cslider:
-    day_string=st.select_slider("Manual shared day — drag to compare maps",options=options,key=slider_key)
-st.caption("Manual only: no autoplay and no timed frames. Prepared days are read from disk. All product tabs follow this date.")
+    i=options.index(st.session_state[slider_key]);st.session_state[slider_key]=options[max(0,min(len(options)-1,i+delta))]
+prev,mid,nxt=st.columns([1,10,1])
+prev.button("◀ Previous",on_click=move_day,args=(-1,),use_container_width=True)
+nxt.button("Next ▶",on_click=move_day,args=(1,),use_container_width=True)
+with mid:day_string=st.select_slider("Manual day — all product maps",options=options,key=slider_key)
 day=date.fromisoformat(day_string)
 left,right=st.columns([1,1])
 connected=bool(st.session_state.get("cdse_auth"))
@@ -1201,10 +1145,6 @@ if connected and st.session_state.get(active_key) and should_request:
             record=process_day(day,config,status,retry=load_one)
     except Exception as exc:st.error(str(exc))
     finally:status.empty()
-navleft,navmid,navright=st.columns([1,5,1])
-navleft.button("◀ Previous day",key="bottom_previous",on_click=move_day,args=(-1,),use_container_width=True)
-navmid.markdown(f"### Selected UTC day: {day}")
-navright.button("Next day ▶",key="bottom_next",on_click=move_day,args=(1,),use_container_width=True)
 if not record.get("s2") and not record["products"]:
     if record["errors"]:
         st.error("No layer completed for this date. Exact errors are shown below.")
@@ -1232,26 +1172,25 @@ else:
                 bands,profile,inside=read_s2(item["path"],config["aoi"])
                 result=smoke_screen(bands,day,params)
                 m1,m2,m3,m4=st.columns(4)
-                m1.metric("Selected-day raw observation coverage",f"{item.get('raw_same_day_coverage',item['coverage']):.1f}%")
-                m2.metric("Same-day method-assessable coverage",f"{item['current_coverage']:.1f}%")
+                m1.metric("Raw selected-day observation coverage",f"{item['coverage']:.1f}%")
+                m2.metric("Same-day assessable coverage",f"{item['current_coverage']:.1f}%")
                 m3.metric("Same-day candidate area",f"{item['current_area']:.2f} km²" if item["current_area"] is not None else "No same-day data")
-                m4.metric("Screening method",params["method"])
+                m4.metric("Classifier", "Loaded" if params.get("model_hash") else "NOT trained")
                 st.json(item.get("diagnostics",{}))
-                if item["current_coverage"]<20:st.warning("LOW ASSESSABLE COVERAGE: this result cannot establish absence of smoke across the AOI.")
-                if item["current_area"] is None:st.error("No method-assessable pixels. Smoke status UNKNOWN, not zero.")
-                elif item["current_pixels"]==0:st.info("No candidates in method-assessable pixels only. This does not establish absence of smoke.")
-                st.caption("Red = same-day experimental anomaly candidates, NOT confirmed smoke. Missing or unassessable pixels do not mean clean air.")
+                if not params.get("model_hash"):st.warning("Smoke status UNKNOWN: no trained classifier. RGB is not a smoke mask.")
+                if item["current_coverage"]<20:st.warning("Low classifier-assessable coverage; do not infer absence of smoke across AOI.")
+                st.caption("Red = model smoke-class candidates, subject to validation. No data and unassessed pixels are UNKNOWN, not smoke-free.")
                 if item["coverage"]>0 and 100*(1-item["quality_coverage"]/item["coverage"])>cloud_warning:
                     st.warning("Cloud/quality-masked fraction exceeds the selected warning threshold; those pixels are not assumed smoke-free.")
                 if item["coverage"]<99:
-                    st.warning(f"The selected-day retrieval has only {item['coverage']:.1f}% observed coverage. Remaining locations have no returned selected-day S2 observation.")
+                    st.warning(f"The selected-day retrieval has only {item['coverage']:.1f}% observed coverage. Remaining locations have no returned S2 observation; changing a reference cannot create those measurements.")
                 if item["current_coverage"]<99:
-                    st.info("Only selected-day observations are shown. Unobserved, quality-masked or baseline-unmatched areas are unknown; no older image replaces them.")
-                show_history=st.checkbox("Show older-observation candidate context in amber",value=False,key="history_"+signature)
+                    st.info("Only selected-day observations are shown. No historical image fills missing target-day pixels.")
+                show_history=False
                 fmap=new_result_map(config["aoi"])
                 rgba=rgb_rgba(bands,inside)
                 show_rgb=st.checkbox("Show selected-day S2 RGB",value=True,key="rgb_"+signature)
-                add_raster(fmap,rgba,profile,"S2 actual observation context (optional)",show=show_rgb)
+                add_raster(fmap,rgba,profile,"Selected-day S2 RGB",show=show_rgb)
                 unknown=inside & ~result["observed"]
                 hatch=np.zeros((*unknown.shape,4),dtype=np.uint8)
                 rr,cc=np.indices(unknown.shape)
@@ -1262,17 +1201,32 @@ else:
                 add_raster(fmap,mask_rgba(result["current"],(230,57,70)),profile,"SAME-DAY spectral candidates")
                 ages=field_rgba(result["age"],[0,29],"viridis_r",200)
                 add_raster(fmap,ages,profile,"Observation age (0–29 days)",show=False)
-                add_raster(fmap,field_rgba(np.where(result["observed"],result["index"],np.nan),[-1,1],"inferno"),profile,"Smoke index (not a validated smoke map)",show=False)
+                add_raster(fmap,field_rgba(result["index"],[0,1],"inferno"),profile,"Model smoke-class score (uncalibrated)",show=False)
                 finish_map(fmap,config["aoi"],"smoke_map_"+signature+str(day),height=620)
                 st.markdown('<span class="result-chip">🔴 Same-day candidate</span><span class="result-chip">🟠 Older candidate</span><span class="result-chip">▧ No S2 observation</span>',unsafe_allow_html=True)
                 with st.expander("Observation age and smoke-screen diagnostics"):
                     st.json(item.get("context",{}))
                     st.image(colorbar_png(0,29,"viridis_r","Observation age · days"),use_container_width=True)
-                    st.caption(f"Nominal requested grid: {grid['res']} m; not native 20 m detail. Method: {params['method']}. Both methods are experimental and require independent inspection.")
+                    st.caption(f"Nominal output spacing: {grid['res']} m. Supervised five-class prototype; local validation required. No heuristic green/SWIR or darkening smoke mask.")
                     st.caption(f"Same-day assessed pixels: {item['current_assessable_pixels']:,}; same-day candidate pixels: {item['current_pixels']:,}.")
                 if item.get("candidate_fraction",0)>0.50:
                     st.warning("More than half of assessable context pixels were flagged: probable water/haze/cloud/surface contamination. This is not confirmed smoke coverage.")
                 st.warning("Exploratory smoke-candidate screening, not a validated smoke classifier or proof of source. These masks cannot establish conflict attribution.")
+                with st.expander("Export feature samples for expert labelling (training data)"):
+                    st.caption("Export contains unlabelled samples. Assign label and group independently; do not auto-label from the model prediction. Group should identify independent scene/site; keep adjacent pixels together. Row/column locate pixels in the downloaded TIFF.")
+                    if st.button("Prepare up to 20000 feature samples",key="feature_export_"+signature+str(day)):
+                        cube=classifier_features(bands)
+                        valid=(bands["dataMask"]>.5)&np.isfinite(cube).all(axis=-1)
+                        ids=np.flatnonzero(valid.ravel())
+                        if len(ids)>20000:ids=np.random.default_rng(42).choice(ids,20000,replace=False)
+                        rows,cols=np.unravel_index(ids,valid.shape)
+                        sample=pd.DataFrame(cube.reshape(-1,len(FEATURE_NAMES))[ids],columns=FEATURE_NAMES)
+                        xs,ys=rasterio.transform.xy(profile["transform"],rows,cols)
+                        sample["longitude"]=xs;sample["latitude"]=ys;sample["row"]=rows;sample["col"]=cols
+                        sample["label"]="";sample["group"]=str(day)
+                        st.session_state["features_"+signature+str(day)]=sample.to_csv(index=False)
+                    feature_csv=st.session_state.get("features_"+signature+str(day))
+                    if feature_csv:st.download_button("Download unlabelled feature CSV",feature_csv,file_name=f"{day}_features_unlabelled.csv",mime="text/csv")
                 with st.expander("Download Sentinel-2 outputs"):
                     candidate=np.where(result["fresh"],result["current"].astype(np.float32),np.nan)
                     historical=np.where(result["quality"] & ~result["fresh"],result["historical"].astype(np.float32),np.nan)
@@ -1345,7 +1299,7 @@ else:
         st.caption("Enable individual layers in the map control. Each product has its own unit and fixed colour scale; overlapping colours are not a combined pollution index.")
 
 with st.expander("Download catalogue + request diagnostic report"):
-    st.download_button("⬇ Diagnostic JSON",json.dumps({"app_version":"v12.0-same-day-manual","config":config,"day_record":record},ensure_ascii=False,indent=2,default=str),
+    st.download_button("⬇ Diagnostic JSON",json.dumps({"app_version":"v13.0-supervised-same-day","config":config,"day_record":record},ensure_ascii=False,indent=2,default=str),
         file_name=f"{day}_catalogue_diagnostics.json",mime="application/json",key="diagnostic_json")
 
 st.markdown('<div class="section-label">05 · DAILY CURVES & DOWNLOADS</div>',unsafe_allow_html=True)
