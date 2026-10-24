@@ -9,6 +9,5 @@ pyproj
 shapely
 scipy
 scikit-image
-scikit-learn>=1.3
 Pillow
 matplotlib
